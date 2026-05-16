@@ -1,0 +1,44 @@
+# AI AppSec PR Reviewer - Backend Dependencies
+
+# Web Framework
+fastapi
+uvicorn[standard]
+
+# HTTP Client for LLM APIs
+httpx
+
+# Data Validation
+pydantic
+pydantic-settings
+
+# Environment Variables
+python-dotenv
+
+# YAML parsing for policy files
+pyyaml
+
+# Database (Supabase)
+supabase
+
+# JWT for authentication
+PyJWT[crypto]
+
+# Stripe for payment processing
+stripe
+
+# Cryptography for GitHub secrets encryption
+PyNaCl
+cryptography>=41.0.0
+
+# Redis for distributed rate limiting (optional but recommended for production)
+redis
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+
+# Development
+black
+isort
+mypy

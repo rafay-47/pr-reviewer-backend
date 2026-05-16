@@ -1,0 +1,14 @@
+.venv
+.env
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+build
+develop-eggs
+dist
+downloads
+eggs
+.eggs-info

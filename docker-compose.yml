@@ -1,0 +1,36 @@
+# Docker Compose for AI AppSec PR Reviewer
+# Usage: docker-compose up -d
+
+version: '3.8'
+
+services:
+  ai-appsec-reviewer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-appsec-reviewer
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-claude}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - API_AUTH_TOKEN=${API_AUTH_TOKEN:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+

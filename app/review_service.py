@@ -1,0 +1,541 @@
+"""
+Review Service Module.
+
+Encapsulates the core PR review logic for use by both the /review-pr endpoint
+and the GitHub webhook handler. This service handles:
+
+- Usage limits checking
+- Policy loading and enforcement mode validation
+- LLM security analysis
+- Suppression rule application
+- Database persistence
+- Finding comparison with previous reviews
+- Metrics tracking
+- Resolved findings tracking
+"""
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any
+
+from .config import Settings
+from .models import ReviewResponse, RepoPolicy, PolicyMode, SecurityFinding
+from .llm_client import analyze_diff, regenerate_markdown_with_resolved
+from .tenants import TenantContext, get_tenant_repo_policy, get_tenant_suppressions, check_suppression
+from .subscriptions import check_can_review_pr, check_feature_access, increment_pr_usage
+from .metrics import MetricsTracker, get_metrics_tracker
+from .database import (
+    create_review,
+    create_findings,
+    get_previous_pr_review,
+    get_previous_pr_findings,
+    compare_pr_reviews,
+    link_review_to_previous,
+    mark_findings_resolved,
+    auto_resolve_pr_findings,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReviewContext:
+    """
+    Context for a PR review operation.
+    
+    Contains all the information needed to perform a security review.
+    """
+    org_id: str
+    org_name: Optional[str] = None
+    repo: str = ""
+    pr_number: int = 0
+    diff: str = ""
+    language: str = "nodejs"
+    framework: str = "express"
+    policy: Optional[RepoPolicy] = None
+    pr_title: Optional[str] = None
+    pr_author: Optional[str] = None
+    previous_fingerprints: List[str] = field(default_factory=list)
+    
+    def to_log_dict(self) -> Dict[str, Any]:
+        """Convert to dict for logging (excludes diff content)."""
+        return {
+            "org_id": self.org_id,
+            "repo": self.repo,
+            "pr_number": self.pr_number,
+            "language": self.language,
+            "framework": self.framework,
+            "has_policy": self.policy is not None,
+            "pr_title": self.pr_title,
+            "pr_author": self.pr_author,
+            "diff_size": len(self.diff) if self.diff else 0,
+        }
+
+
+@dataclass
+class ReviewResult:
+    """
+    Result of a PR review operation.
+    
+    Contains the review response and metadata about the operation.
+    """
+    success: bool
+    response: ReviewResponse
+    review_id: Optional[str] = None
+    error_message: Optional[str] = None
+    should_post_comment: bool = True
+    
+    @classmethod
+    def success_result(
+        cls,
+        response: ReviewResponse,
+        review_id: Optional[str] = None,
+        should_post_comment: bool = True
+    ) -> "ReviewResult":
+        """Create a successful result."""
+        return cls(
+            success=True,
+            response=response,
+            review_id=review_id,
+            should_post_comment=should_post_comment
+        )
+    
+    @classmethod
+    def error_result(
+        cls,
+        error_message: str,
+        should_post_comment: bool = True
+    ) -> "ReviewResult":
+        """Create an error result with a graceful response."""
+        response = ReviewResponse(
+            summary=f"Security review encountered an error: {error_message}",
+            findings=[],
+            findings_markdown=f"""## 🔒 AI Security Review
+
+<!-- AI_APPSEC_REVIEW -->
+
+**⚠️ Error:** The security review could not be completed.
+
+{error_message}
+
+Please check the service configuration and try again. If the problem persists, contact the service administrator.
+
+---
+*AI AppSec PR Reviewer*""",
+            total_findings_before_filter=0,
+            filtered_by_policy=False,
+            needs_manual_review=[],
+            findings_hash=None
+        )
+        return cls(
+            success=False,
+            response=response,
+            error_message=error_message,
+            should_post_comment=should_post_comment
+        )
+
+
+class ReviewService:
+    """
+    Service for performing PR security reviews.
+    
+    This service encapsulates the core review logic and can be used by:
+    - The /review-pr HTTP endpoint
+    - The GitHub webhook handler
+    - Any other automated review triggers
+    """
+    
+    def __init__(self, settings: Settings):
+        """
+        Initialize the review service.
+        
+        Args:
+            settings: Application settings containing LLM config, etc.
+        """
+        self.settings = settings
+        self.metrics_tracker = get_metrics_tracker()
+    
+    async def review_pr(
+        self,
+        context: ReviewContext,
+        tenant: Optional[TenantContext] = None
+    ) -> ReviewResult:
+        """
+        Perform a security review of a pull request.
+        
+        This is the main entry point for PR reviews. It handles:
+        1. Usage limits checking
+        2. Policy loading and enforcement validation
+        3. LLM security analysis
+        4. Suppression rule application
+        5. Database persistence
+        6. Finding comparison with previous reviews
+        7. Metrics tracking
+        
+        Args:
+            context: Review context containing PR information
+            tenant: Optional tenant context for multi-tenant mode
+            
+        Returns:
+            ReviewResult containing the review response and metadata
+        """
+        log_data = context.to_log_dict()
+        logger.info(f"Starting PR review: {log_data}")
+        
+        # Validate LLM is configured
+        if not self.settings.llm_api_key:
+            logger.error("LLM API key not configured")
+            return ReviewResult.error_result(
+                "LLM API key not configured. Set LLM_API_KEY environment variable."
+            )
+        
+        # Check usage limits if we have an org_id
+        if context.org_id:
+            can_review, limit_message = await check_can_review_pr(context.org_id)
+            if not can_review:
+                logger.warning(f"PR review blocked for org {context.org_id}: {limit_message}")
+                return ReviewResult.error_result(
+                    limit_message or "Monthly PR review limit exceeded. Please upgrade your plan."
+                )
+        
+        # Load policy from database if not provided and we have a tenant
+        policy = context.policy
+        enforcement_available = True
+        enforcement_downgraded = False
+        
+        if tenant and not policy:
+            db_policy = await get_tenant_repo_policy(tenant, context.repo)
+            if db_policy:
+                policy = RepoPolicy(**db_policy)
+        
+        # Check if enforcement mode is available for this organization
+        if policy and policy.mode.value == "enforce" and context.org_id:
+            can_enforce, enforce_message = await check_feature_access(context.org_id, "enforcement_mode")
+            if not can_enforce:
+                # Downgrade to advisory mode
+                policy.mode = PolicyMode.ADVISORY
+                enforcement_available = False
+                enforcement_downgraded = True
+                logger.info(f"Downgraded to advisory mode for org {context.org_id}: {enforce_message}")
+        
+        # Track timing for metrics
+        start_time = time.time()
+        
+        try:
+            # Load suppression rules for tenant
+            suppressions = []
+            if tenant:
+                suppressions = await get_tenant_suppressions(tenant)
+            
+            # Get previous findings for this PR to track changes
+            previous_findings = []
+            previous_fingerprints = context.previous_fingerprints.copy()
+            
+            if tenant and self.settings.database_configured:
+                try:
+                    prev_findings = await get_previous_pr_findings(
+                        tenant.org_id, context.repo, context.pr_number
+                    )
+                    if prev_findings:
+                        previous_findings = prev_findings
+                        prev_fps = [f.get("fingerprint", "") for f in prev_findings if f.get("fingerprint")]
+                        previous_fingerprints.extend(prev_fps)
+                        logger.info(f"Found {len(prev_findings)} findings from previous review of PR #{context.pr_number}")
+                except Exception as e:
+                    logger.warning(f"Could not fetch previous findings: {e}")
+            
+            # Perform the security analysis with policy and deduplication
+            result = await analyze_diff(
+                diff_text=context.diff,
+                language=context.language,
+                framework=context.framework,
+                llm_provider=self.settings.llm_provider,
+                api_key=self.settings.llm_api_key,
+                model=self.settings.effective_model,
+                policy=policy,
+                previous_fingerprints=previous_fingerprints,
+            )
+            
+            # Apply tenant-specific suppression rules
+            if suppressions and result.findings:
+                original_count = len(result.findings)
+                result.findings = [
+                    f for f in result.findings 
+                    if not check_suppression(f.model_dump(), suppressions)
+                ]
+                suppressed_count = original_count - len(result.findings)
+                if suppressed_count > 0:
+                    logger.info(f"Suppressed {suppressed_count} findings by tenant rules")
+            
+            # Normalize findings to avoid TypeError on None
+            findings = result.findings or []
+            needs_review = result.needs_manual_review or []
+            
+            # Calculate review time
+            review_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Record metrics (in-memory)
+            self.metrics_tracker.record_review(
+                repo=context.repo,
+                pr_number=context.pr_number,
+                review_time_ms=review_time_ms,
+                findings=findings,
+                success=True
+            )
+            
+            # Persist to database if in multi-tenant mode
+            review_id = None
+            logger.info(f"[PERSIST] Checking persistence: tenant={tenant is not None}, database_configured={self.settings.database_configured}")
+            if tenant and self.settings.database_configured:
+                logger.info(f"[PERSIST] Starting persistence for org {tenant.org_id} with {len(findings)} findings")
+                try:
+                    review_id = await self._persist_review(
+                        context=context,
+                        tenant=tenant,
+                        result=result,
+                        findings=findings,
+                        needs_review=needs_review,
+                        review_time_ms=review_time_ms,
+                        previous_findings=previous_findings,
+                        previous_fingerprints=previous_fingerprints
+                    )
+                    logger.info(f"[PERSIST] Successfully persisted review with ID: {review_id}")
+                except Exception as e:
+                    logger.error(f"[PERSIST] Failed to persist review: {e}", exc_info=True)
+                    review_id = None
+            
+            # Secure logging - only log counts, not content
+            logger.info(f"Review completed: {len(findings)} findings, "
+                    f"{len(needs_review)} needs review, "
+                        f"filtered={result.filtered_by_policy}, "
+                        f"new={result.new_findings_count}, still_present={result.still_present_count}, "
+                        f"resolved={result.resolved_findings_count}, "
+                        f"enforcement_downgraded={enforcement_downgraded}, "
+                        f"time={review_time_ms}ms")
+            
+            # Add enforcement flags to response
+            result.enforcement_available = enforcement_available
+            result.enforcement_downgraded = enforcement_downgraded
+            
+            # If enforcement was downgraded, ensure should_block is False
+            if enforcement_downgraded:
+                result.should_block = False
+            
+            return ReviewResult.success_result(
+                response=result,
+                review_id=review_id,
+                should_post_comment=True
+            )
+            
+        except ValueError as e:
+            review_time_ms = int((time.time() - start_time) * 1000)
+            self.metrics_tracker.record_review(
+                repo=context.repo,
+                pr_number=context.pr_number,
+                review_time_ms=review_time_ms,
+                findings=[],
+                success=False,
+                error_type="validation_error"
+            )
+            logger.error(f"Validation error during review: {e}")
+            return ReviewResult.error_result(str(e))
+            
+        except Exception as e:
+            review_time_ms = int((time.time() - start_time) * 1000)
+            self.metrics_tracker.record_review(
+                repo=context.repo,
+                pr_number=context.pr_number,
+                review_time_ms=review_time_ms,
+                findings=[],
+                success=False,
+                error_type=type(e).__name__
+            )
+            logger.error(f"Error during review: {type(e).__name__}: {str(e)}")
+            logger.exception("Full traceback:")
+            return ReviewResult.error_result(
+                "The security review could not be completed due to an internal error."
+            )
+    
+    async def _persist_review(
+        self,
+        context: ReviewContext,
+        tenant: TenantContext,
+        result: ReviewResponse,
+        findings: List[SecurityFinding],
+        needs_review: List[SecurityFinding],
+        review_time_ms: int,
+        previous_findings: List[Dict[str, Any]],
+        previous_fingerprints: List[str]
+    ) -> Optional[str]:
+        """
+        Persist the review results to the database.
+        
+        Args:
+            context: Review context
+            tenant: Tenant context
+            result: Review response
+            findings: List of findings
+            needs_review: List of findings needing manual review
+            review_time_ms: Time taken for review in milliseconds
+            previous_findings: Previous findings from prior reviews
+            previous_fingerprints: Fingerprints from previous reviews
+            
+        Returns:
+            Review ID if persisted successfully, None otherwise
+        """
+        try:
+            # Count by severity
+            def get_risk_value(finding):
+                risk = getattr(finding, "risk", None)
+                return getattr(risk, "value", risk)
+            
+            high_count = len([f for f in findings if get_risk_value(f) == "HIGH"])
+            medium_count = len([f for f in findings if get_risk_value(f) == "MEDIUM"])
+            low_count = len([f for f in findings if get_risk_value(f) == "LOW"])
+            
+            # Get previous review for linking
+            previous_review = await get_previous_pr_review(
+                tenant.org_id, context.repo, context.pr_number
+            )
+            
+            # Calculate findings comparison BEFORE creating the review
+            new_findings_count = len(findings)  # Default: all are new
+            resolved_findings_count = 0
+            still_present_count = 0
+            comparison = None
+            resolved_details = []
+            
+            if previous_fingerprints:
+                current_fingerprints = [f.fingerprint for f in findings if f.fingerprint]
+                comparison = await compare_pr_reviews(
+                    tenant.org_id, context.repo, context.pr_number,
+                    current_fingerprints, previous_fingerprints
+                )
+                new_findings_count = comparison["new_count"]
+                resolved_findings_count = comparison["resolved_count"]
+                still_present_count = comparison["still_present_count"]
+            
+            # Calculate active findings counts (status = 'open')
+            active_findings_count = len([f for f in findings if getattr(f, 'status', 'open') == 'open'])
+            active_high_count = len([f for f in findings if getattr(f, 'status', 'open') == 'open' and get_risk_value(f) == "HIGH"])
+            active_medium_count = len([f for f in findings if getattr(f, 'status', 'open') == 'open' and get_risk_value(f) == "MEDIUM"])
+            active_low_count = len([f for f in findings if getattr(f, 'status', 'open') == 'open' and get_risk_value(f) == "LOW"])
+            
+            # Create review record with all counts
+            logger.info(f"[_persist_review] Creating review record for org {tenant.org_id}, repo {context.repo}, PR #{context.pr_number}")
+            review_record = await create_review(
+                org_id=tenant.org_id,
+                repo_name=context.repo,
+                pr_number=context.pr_number,
+                review_time_ms=review_time_ms,
+                findings_count=len(findings),
+                high_count=high_count,
+                medium_count=medium_count,
+                low_count=low_count,
+                needs_review_count=len(needs_review),
+                success=True,
+                should_block=result.should_block,
+                new_findings_count=new_findings_count,
+                resolved_findings_count=resolved_findings_count,
+                still_present_count=still_present_count,
+                active_findings_count=active_findings_count,
+                active_high_count=active_high_count,
+                active_medium_count=active_medium_count,
+                active_low_count=active_low_count,
+                pr_title=context.pr_title,
+                pr_author=context.pr_author
+            )
+            
+            review_id = review_record["id"]
+            logger.info(f"[_persist_review] Created review with ID: {review_id}")
+            
+            # Link to previous review
+            if previous_review:
+                await link_review_to_previous(review_id, previous_review["id"])
+            
+            # Persist both confirmed findings and needs-review findings so
+            # dashboard/finding lists reflect the complete analysis results.
+            findings_data = [f.model_dump() for f in findings]
+            findings_data.extend([f.model_dump() for f in needs_review])
+            if findings_data:
+                logger.info(
+                    f"[_persist_review] Creating {len(findings_data)} findings for review {review_id} "
+                    f"({len(findings)} confirmed, {len(needs_review)} needs_review)"
+                )
+                logger.info(f"[_persist_review] Findings data sample: {findings_data[0] if findings_data else 'empty'}")
+                await create_findings(review_id, tenant.org_id, findings_data)
+                logger.info(f"[_persist_review] Successfully created {len(findings_data)} findings")
+            
+            # Mark resolved findings and update result
+            if comparison and comparison.get("resolved_fingerprints"):
+                resolved_count = await mark_findings_resolved(
+                    tenant.org_id, comparison["resolved_fingerprints"]
+                )
+                logger.info(f"Marked {resolved_count} findings as resolved")
+                
+                # Update result with resolved findings info
+                result.resolved_findings_count = comparison["resolved_count"]
+                # Get details of resolved findings
+                resolved_details = [
+                    {
+                        "fingerprint": f.get("fingerprint"),
+                        "title": f.get("title"),
+                        "risk": f.get("risk"),
+                        "file_path": f.get("file_path"),
+                        "line_range": f.get("line_range")
+                    }
+                    for f in previous_findings
+                    if f.get("fingerprint") in comparison["resolved_fingerprints"]
+                ]
+                result.resolved_findings = resolved_details
+                
+                # Regenerate markdown to include resolved findings
+                result.findings_markdown = regenerate_markdown_with_resolved(
+                    result, resolved_details, comparison["resolved_count"]
+                )
+            
+            # Auto-resolve all findings if PR is clean (0 findings)
+            if len(findings) == 0 and previous_fingerprints:
+                auto_resolved_count = await auto_resolve_pr_findings(
+                    tenant.org_id, context.repo, context.pr_number, review_id
+                )
+                if auto_resolved_count > 0:
+                    logger.info(f"Auto-resolved {auto_resolved_count} findings - PR is clean")
+                    result.resolved_findings_count = auto_resolved_count
+                    # Get details of all auto-resolved findings for the markdown
+                    auto_resolved_details = [
+                        {
+                            "fingerprint": f.get("fingerprint"),
+                            "title": f.get("title"),
+                            "risk": f.get("risk"),
+                            "file_path": f.get("file_path"),
+                            "line_range": f.get("line_range")
+                        }
+                        for f in previous_findings
+                    ]
+                    result.resolved_findings = auto_resolved_details
+                    # Add message to summary
+                    result.summary = f"✅ PR is clean! Auto-resolved {auto_resolved_count} previous findings."
+                    # Regenerate markdown with resolved findings
+                    result.findings_markdown = regenerate_markdown_with_resolved(
+                        result, auto_resolved_details, auto_resolved_count
+                    )
+            
+            logger.info(f"Persisted review {review_id} to database")
+            
+            # Increment PR usage count for billing
+            try:
+                usage_incremented = await increment_pr_usage(tenant.org_id)
+                if usage_incremented:
+                    logger.info(f"Incremented PR usage for org {tenant.org_id}")
+                else:
+                    logger.error(f"Failed to increment PR usage for org {tenant.org_id}")
+            except Exception as usage_error:
+                logger.error(f"Failed to increment PR usage: {usage_error}")
+            
+            return review_id
+            
+        except Exception as e:
+            logger.error(f"Failed to persist review to database: {e}")
+            return None
