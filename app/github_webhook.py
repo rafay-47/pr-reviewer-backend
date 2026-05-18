@@ -223,6 +223,52 @@ async def post_pr_comment(
         return response.json()
 
 
+async def update_pr_merge_status(
+    owner: str,
+    repo: str,
+    commit_sha: str,
+    installation_id: int,
+    state: str,
+    description: str,
+    settings: Optional[Settings] = None,
+    context: str = "ai-appsec/high-vuln-gate",
+    target_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Publish a commit status used by branch protection to gate PR merges.
+
+    States: error, failure, pending, success.
+    """
+    if settings is None:
+        settings = get_settings()
+
+    if not commit_sha:
+        raise ValueError("Missing commit_sha for status update")
+
+    token, _ = await get_installation_token(installation_id, settings)
+    payload: Dict[str, Any] = {
+        "state": state,
+        "description": description[:140],
+        "context": context,
+    }
+    if target_url:
+        payload["target_url"] = target_url
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://api.github.com/repos/{owner}/{repo}/statuses/{commit_sha}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            json=payload,
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 async def post_inline_comment(
     owner: str,
     repo: str,
@@ -1016,6 +1062,7 @@ async def process_pull_request_webhook(
     pr_number = pr_data.get("number")
     pr_title = pr_data.get("title")
     pr_author = pr_data.get("user", {}).get("login")
+    pr_head_sha = pr_data.get("head", {}).get("sha")
     
     if not pr_number:
         raise ValueError("Missing PR number in webhook payload")
@@ -1079,6 +1126,21 @@ async def process_pull_request_webhook(
     if len(parts) != 2:
         raise ValueError(f"Invalid repository name format: {repo_full_name}")
     owner, repo = parts
+
+    # Mark check as pending as soon as we start processing.
+    if pr_head_sha:
+        try:
+            await update_pr_merge_status(
+                owner=owner,
+                repo=repo,
+                commit_sha=pr_head_sha,
+                installation_id=installation_id,
+                state="pending",
+                description="AI AppSec security review in progress",
+                settings=settings,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish pending merge-gate status: {e}")
     
     # Fetch PR diff
     try:
@@ -1134,6 +1196,51 @@ async def process_pull_request_webhook(
     # Perform review with tenant context for persistence
     service = ReviewService(settings)
     result = await service.review_pr(context, tenant)
+
+    # Publish a required status check result for branch protection.
+    if pr_head_sha:
+        try:
+            should_block = bool(result.response.should_block) if (result.success and result.response) else False
+            high_count = 0
+            if result.response and result.response.findings:
+                high_count = sum(
+                    1
+                    for finding in result.response.findings
+                    if _normalize_severity(getattr(finding, "risk", "")) == "HIGH"
+                )
+
+            if not result.success:
+                await update_pr_merge_status(
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=pr_head_sha,
+                    installation_id=installation_id,
+                    state="error",
+                    description="AI AppSec review failed",
+                    settings=settings,
+                )
+            elif should_block:
+                await update_pr_merge_status(
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=pr_head_sha,
+                    installation_id=installation_id,
+                    state="failure",
+                    description=f"Blocked: {high_count} HIGH vulnerability findings",
+                    settings=settings,
+                )
+            else:
+                await update_pr_merge_status(
+                    owner=owner,
+                    repo=repo,
+                    commit_sha=pr_head_sha,
+                    installation_id=installation_id,
+                    state="success",
+                    description="No blocking HIGH vulnerabilities found",
+                    settings=settings,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to publish final merge-gate status: {e}")
     
     # Post review to GitHub if successful
     if result.should_post_comment:
