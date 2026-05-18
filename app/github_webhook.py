@@ -1230,13 +1230,35 @@ async def process_pull_request_webhook(
                     settings=settings,
                 )
             else:
+                policy_mode = "advisory"
+                if policy and hasattr(policy, "mode"):
+                    policy_mode = (
+                        str(policy.mode.value)
+                        if hasattr(policy.mode, "value")
+                        else str(policy.mode)
+                    )
+
+                # Avoid misleading success text when HIGH findings exist but policy
+                # is advisory (or enforcement was downgraded).
+                if high_count > 0:
+                    if policy_mode == "enforce":
+                        success_description = (
+                            "HIGH findings present but below enforcement threshold"
+                        )
+                    else:
+                        success_description = (
+                            f"HIGH findings present ({high_count}); policy mode is {policy_mode}"
+                        )
+                else:
+                    success_description = "No HIGH vulnerabilities found"
+
                 await update_pr_merge_status(
                     owner=owner,
                     repo=repo,
                     commit_sha=pr_head_sha,
                     installation_id=installation_id,
                     state="success",
-                    description="No blocking HIGH vulnerabilities found",
+                    description=success_description,
                     settings=settings,
                 )
         except Exception as e:
