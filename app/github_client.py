@@ -10,6 +10,7 @@ Provides async functions for:
 
 import base64
 import logging
+from urllib.parse import quote
 from typing import Optional
 from dataclasses import dataclass
 
@@ -843,6 +844,48 @@ class GitHubClient:
         
         permissions = repo_data.permissions
         return permissions.get("push", False) or permissions.get("admin", False)
+
+    async def get_branch_protection(self, owner: str, repo: str, branch: str) -> Optional[dict]:
+        """Get branch protection configuration for a branch."""
+        branch_ref = quote(branch, safe="")
+        return await self._request("GET", f"/repos/{owner}/{repo}/branches/{branch_ref}/protection")
+
+    async def ensure_required_status_check(
+        self,
+        owner: str,
+        repo: str,
+        branch: str,
+        context_name: str,
+    ) -> dict:
+        """
+        Ensure branch protection requires a given status-check context.
+        """
+        existing = await self.get_branch_protection(owner, repo, branch)
+        current_contexts = []
+        if existing:
+            current_contexts = (existing.get("required_status_checks") or {}).get("contexts") or []
+
+        merged_contexts = sorted(set(current_contexts + [context_name]))
+        branch_ref = quote(branch, safe="")
+        payload = {
+            "required_status_checks": {"strict": True, "contexts": merged_contexts},
+            "enforce_admins": False,
+            "required_pull_request_reviews": None,
+            "restrictions": None,
+        }
+
+        result = await self._request(
+            "PUT",
+            f"/repos/{owner}/{repo}/branches/{branch_ref}/protection",
+            json=payload,
+        )
+        return {
+            "success": True,
+            "branch": branch,
+            "required_context": context_name,
+            "contexts": merged_contexts,
+            "protection": result or {},
+        }
     
     async def get_repo_public_key(self, owner: str, repo: str) -> dict:
         """

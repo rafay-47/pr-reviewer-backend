@@ -3314,12 +3314,13 @@ async def install_workflows(
     # Get GitHub token from secure database storage
     github_token = await get_github_token_for_tenant(tenant)
     
-    from .github_client import install_workflow_to_repo
+    from .github_client import install_workflow_to_repo, GitHubClient
     from .models import WorkflowInstallResult
     
     results = []
     total_success = 0
     total_failed = 0
+    required_check_context = "ai-appsec/high-vuln-gate"
     
     for repo_full_name in install_request.repos:
         parts = repo_full_name.split("/")
@@ -3339,6 +3340,35 @@ async def install_workflows(
             result = await install_workflow_to_repo(github_token, owner, repo)
             
             if result["success"]:
+                # Auto-enforce required status check on the default branch so
+                # HIGH findings can block merges without manual GitHub setup.
+                protection_error = None
+                try:
+                    gh_client = GitHubClient(github_token)
+                    repo_data = await gh_client.get_repo(owner, repo)
+                    default_branch = repo_data.default_branch if repo_data else "main"
+                    await gh_client.ensure_required_status_check(
+                        owner=owner,
+                        repo=repo,
+                        branch=default_branch,
+                        context_name=required_check_context,
+                    )
+                except Exception as e:
+                    protection_error = (
+                        f"Workflow installed, but auto-protection failed: {str(e)}"
+                    )
+
+                if protection_error:
+                    results.append(WorkflowInstallResult(
+                        repo_name=repo_full_name,
+                        success=False,
+                        action="failed",
+                        error=protection_error,
+                        commit_sha=result.get("commit_sha"),
+                    ))
+                    total_failed += 1
+                    continue
+
                 results.append(WorkflowInstallResult(
                     repo_name=repo_full_name,
                     success=True,
