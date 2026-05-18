@@ -3182,7 +3182,9 @@ async def import_github_repos(
     tenant.require_scope("admin:policy")
     
     from .models import GitHubImportResult
-    from .database import list_repo_configs
+    from .database import list_repo_configs, get_supabase_client
+    from .github_app_auth import get_installation_token, InstallationNotFoundError
+    from .github_client import GitHubClient
 
     # Enforce repository limits before processing the import batch.
     # Count semantics follow existing usage logic: enabled repos only.
@@ -3234,9 +3236,43 @@ async def import_github_repos(
     
     if import_request.default_policy:
         default_policy = import_request.default_policy.model_dump()
+
+    # Use GitHub App installation token for automatic branch protection setup.
+    required_check_context = "ai-appsec/high-vuln-gate"
+    supabase_client = get_supabase_client()
+    installation_result = supabase_client.table("github_app_installations").select("*").eq(
+        "org_id", tenant.org_id
+    ).eq("is_active", True).order("installed_at", desc=True).limit(1).execute()
+
+    if not installation_result.data:
+        raise HTTPException(
+            status_code=400,
+            detail="GitHub App not installed. Install and link the GitHub App before importing repositories.",
+        )
+
+    installation_id = installation_result.data[0].get("installation_id")
+    if not installation_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid GitHub App installation. Please reinstall/link the GitHub App.",
+        )
+
+    try:
+        github_token, _ = await get_installation_token(installation_id)
+    except InstallationNotFoundError:
+        raise HTTPException(
+            status_code=409,
+            detail="GitHub App installation is no longer active. Please reconnect the GitHub App.",
+        )
+    github_client = GitHubClient(github_token)
     
     for repo_name in import_request.repos:
         try:
+            parts = repo_name.split("/")
+            if len(parts) != 2:
+                raise ValueError("Invalid repo format. Expected owner/repo")
+            owner, repo = parts
+
             config = await upsert_repo_config(
                 org_id=tenant.org_id,
                 repo_name=repo_name,
@@ -3244,6 +3280,17 @@ async def import_github_repos(
                 enabled=True,
                 source="github",
             )
+
+            # Auto-enforce merge gate for imported repositories.
+            repo_data = await github_client.get_repo(owner, repo)
+            default_branch = repo_data.default_branch if repo_data else "main"
+            await github_client.ensure_required_status_check(
+                owner=owner,
+                repo=repo,
+                branch=default_branch,
+                context_name=required_check_context,
+            )
+
             results.append(GitHubImportResult(
                 repo_name=repo_name,
                 success=True,
