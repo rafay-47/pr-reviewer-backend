@@ -855,11 +855,21 @@ async def create_findings(review_id: str, org_id: str, findings: list[dict]) -> 
         return []
 
     def _normalize_risk(value: Any) -> str:
-        raw = str(value or "MEDIUM").upper()
+        if value is None:
+            raw = "MEDIUM"
+        elif hasattr(value, "value"):
+            raw = str(value.value).upper()
+        else:
+            raw = str(value).upper().split(".")[-1]
         return raw if raw in {"HIGH", "MEDIUM", "LOW"} else "MEDIUM"
 
     def _normalize_confidence(value: Any) -> str:
-        raw = str(value or "MEDIUM").upper()
+        if value is None:
+            raw = "MEDIUM"
+        elif hasattr(value, "value"):
+            raw = str(value.value).upper()
+        else:
+            raw = str(value).upper().split(".")[-1]
         return raw if raw in {"HIGH", "MEDIUM", "LOW", "NEEDS_REVIEW"} else "MEDIUM"
 
     def _normalize_uuid(value: Any) -> str:
