@@ -416,13 +416,10 @@ async def post_inline_comments_for_findings(
             line = 1
         
         # Build comment body
-        risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(
-            str(finding.get("risk", "MEDIUM")).upper(), "⚪"
-        )
-        
+        risk_label = str(finding.get("risk", "MEDIUM")).upper()
         fingerprint = finding.get("fingerprint", "")
         
-        body = f"""**{risk_emoji} Security Finding: {finding.get('title', 'Issue')}**
+        body = f"""**[{risk_label}] Security Finding: {finding.get('title', 'Issue')}**
 
 {finding.get('description', '')}
 
@@ -652,90 +649,75 @@ async def post_pr_review_with_suggestions(
 
 
 def _build_inline_comment_body(finding: Dict[str, Any]) -> str:
-    """Build the markdown body for an inline review comment with optional suggestion."""
+    """Build an inline review comment for a specific line."""
     severity = finding.get("severity") or finding.get("risk") or "MEDIUM"
     severity_str = _normalize_severity(severity)
-    severity_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(severity_str, "⚪")
-    
-    finding_type = finding.get("type", finding.get("title", "Security Issue")).replace("_", " ").title()
-    
-    lines = [
-        f"{severity_emoji} **[{severity_str}] {finding_type}**",
-        "",
-    ]
-    
-    # Get file and line info
+    title = finding.get("title", "Security Issue")
+
     file_path = finding.get("file_path", finding.get("file", "unknown"))
     line_start = finding.get("line_start") or finding.get("line", "")
     line_end = finding.get("line_end", "")
     line_range = f"{line_start}-{line_end}" if line_start and line_end else str(line_start) if line_start else ""
-    
-    if file_path and file_path != "unknown":
-        lines.append(f"📁 File: `{file_path}{':' + line_range if line_range else ''}`")
-    
-    # Status (new vs still present)
     is_new = finding.get("is_new", True)
-    status_emoji = "🆕 NEW" if is_new else "🔄 Still Present"
-    lines.append(f"Status: **{status_emoji}**")
-    
-    # Confidence with emoji
-    confidence = finding.get("confidence")
-    if confidence:
-        confidence_str = _normalize_confidence(confidence)
-        conf_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(confidence_str, "⚪")
-        lines.append(f"🎯 Confidence: {conf_emoji} {confidence_str}")
-    
-    lines.append("")
-    
-    # Issue/description
+    status_text = "New" if is_new else "Still present"
+
+    lines = [
+        f"**Severity: {severity_str}** — {title}",
+        "",
+    ]
+
+    if file_path and file_path != "unknown":
+        lines.append(f"**File:** `{file_path}` line {line_range} — {status_text}")
+        lines.append("")
+
     description = finding.get("description") or finding.get("issue") or ""
     if description:
-        lines.append(f"❌ **Issue:** {description}")
+        lines.append(description)
         lines.append("")
-    
-    # Impact
+
     impact = finding.get("impact") or finding.get("impact_description")
     if impact:
-        lines.append(f"⚠️ **Impact:** {impact}")
+        lines.append(f"**Impact:** {impact}")
         lines.append("")
-    
-    # Recommendation
+
     recommendation = finding.get("recommendation")
     if recommendation:
-        lines.append(f"✅ **Recommendation:** {recommendation}")
+        lines.append(f"**Fix:** {recommendation}")
         lines.append("")
-    
-    # Evidence/code snippet
+
     evidence = finding.get("evidence") or finding.get("code_snippet")
     if evidence:
-        lines.append("📋 **Evidence:**")
-        lines.append(f"```\n{evidence}\n```")
+        lines.append("```")
+        lines.append(evidence)
+        lines.append("```")
         lines.append("")
-    
-    # Example fix
+
     example_fix = finding.get("example_fix") or finding.get("suggested_fix")
     if example_fix:
-        lines.append("💡 **Example Fix:**")
-        lines.append(f"```\n{example_fix}\n```")
+        lines.append("```")
+        lines.append(example_fix)
+        lines.append("```")
         lines.append("")
-    
-    # References (CWE, OWASP)
+
     refs = []
     if finding.get("cwe"):
         refs.append(f"CWE-{finding['cwe']}")
     if finding.get("owasp"):
         refs.append(f"OWASP: {finding['owasp']}")
     if refs:
-        lines.append(f"📚 **References:** {' | '.join(refs)}")
+        lines.append(f"**Refs:** {' | '.join(refs)}")
         lines.append("")
-    
-    # Add fingerprint for dismissal
+
+    confidence = finding.get("confidence")
+    if confidence:
+        confidence_str = _normalize_confidence(confidence)
+        lines.append(f"**Confidence:** {confidence_str}")
+        lines.append("")
+
     fingerprint = finding.get("fingerprint")
     if fingerprint:
-        lines.extend([
-            f"*To dismiss: `/ignore {fingerprint}`*"
-        ])
-    
+        lines.append(f"*Dismiss: `/ignore {fingerprint}`*")
+
     return "\n".join(lines)
 
 
@@ -759,92 +741,70 @@ def _build_pr_review_body(
     resolved_findings: List[Dict] = None,
     summary: str = ""
 ) -> str:
-    """Build the top-level review comment summarizing all findings."""
+    """Build the PR review summary comment."""
     resolved_findings = resolved_findings or []
-    
+
     high = [f for f in all_findings if _normalize_severity(f.get("severity", f.get("risk", ""))) == "HIGH"]
     med = [f for f in all_findings if _normalize_severity(f.get("severity", f.get("risk", ""))) == "MEDIUM"]
     low = [f for f in all_findings if _normalize_severity(f.get("severity", f.get("risk", ""))) == "LOW"]
-    
+
     lines = [
-        "## 🔒 AI Security Review",
+        "## Security Review",
         "",
     ]
-    
-    # Add summary line if provided
+
     if summary:
-        lines.append(f"**Summary:** {summary}")
+        lines.append(summary)
         lines.append("")
-    
-    # Show resolved findings section FIRST if any were resolved (good news first!)
+
     if resolved_findings:
-        lines.append("### ✅ Resolved Issues")
-        lines.append("")
-        lines.append(f"**{len(resolved_findings)} issue(s) from the previous review have been fixed!**")
+        lines.append(f"**{len(resolved_findings)} previous finding(s) resolved in this PR.**")
         lines.append("")
         for rf in resolved_findings:
-            risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(_normalize_severity(rf.get("risk", "")), "⚪")
+            risk_label = _normalize_severity(rf.get("risk", ""))
             title = rf.get("title", "Unknown issue")
             file_path = rf.get("file_path", rf.get("file", "unknown"))
             line_range = rf.get("line_range", "")
-            lines.append(f"- {risk_emoji} ~~{title}~~ (`{file_path}{':' + line_range if line_range else ''}`)")
+            location = f"{file_path}:{line_range}" if line_range else file_path
+            lines.append(f"- ~~[{risk_label}] {title}~~ — `{location}`")
         lines.append("")
         lines.append("---")
         lines.append("")
-    
-    # Stats line
-    stats_parts = []
-    if high:
-        stats_parts.append(f"🔴 {len(high)} High")
-    if med:
-        stats_parts.append(f"🟠 {len(med)} Medium")
-    if low:
-        stats_parts.append(f"🟡 {len(low)} Low")
-    
-    if stats_parts:
-        lines.append(f"**Findings:** {' | '.join(stats_parts)}")
-    else:
-        lines.append("**Findings:** ✅ No security vulnerabilities identified")
-    
-    lines.append("")
-    
-    # List findings with more detail
-    for f in all_findings:
-        risk_str = _normalize_severity(f.get("severity", f.get("risk", "")))
-        risk_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(risk_str, "⚪")
-        title = f.get("title", "Security Issue")
-        file_path = f.get("file_path", f.get("file", "unknown"))
-        line_start = f.get("line_start") or f.get("line", "")
-        line_end = f.get("line_end", "")
-        line_range = f"{line_start}-{line_end}" if line_start and line_end else str(line_start) if line_start else ""
-        
-        is_new = f.get("is_new", True)
-        status_emoji = "🆕 NEW" if is_new else "🔄 Still Present"
-        
-        lines.append(f"### {risk_emoji} [{risk_str}] {title}")
-        lines.append(f"📁 File: `{file_path}{':' + line_range if line_range else ''}` | Status: **{status_emoji}**")
-        
-        # Confidence
-        conf_str = _normalize_confidence(f.get("confidence", "MEDIUM"))
-        conf_emoji = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}.get(conf_str, "⚪")
-        lines.append(f"🎯 Confidence: {conf_emoji} {conf_str}")
-        
+
+    if all_findings:
+        lines.append(f"**{len(all_findings)} finding(s):** {len(high)} high, {len(med)} medium, {len(low)} low")
         lines.append("")
-    
-    # Findings that couldn't be pinned to a line
+
+        for f in all_findings:
+            risk_str = _normalize_severity(f.get("severity", f.get("risk", "")))
+            title = f.get("title", "Security Issue")
+            file_path = f.get("file_path", f.get("file", "unknown"))
+            line_start = f.get("line_start") or f.get("line", "")
+            line_end = f.get("line_end", "")
+            line_range = f"{line_start}-{line_end}" if line_start and line_end else str(line_start) if line_start else ""
+            location = f"{file_path}:{line_range}" if line_range else file_path
+            is_new = f.get("is_new", True)
+            status_text = "New" if is_new else "Still present"
+
+            lines.append(f"- **[{risk_str}]** {title} — `{location}` — {status_text}")
+
+        lines.append("")
+
     if summary_findings:
-        lines.append("### 📝 Additional Findings")
+        lines.append("**Additional findings (no line location):**")
         lines.append("")
         for f in summary_findings:
             file_path = f.get("file_path", f.get("file", "unknown"))
             lines.append(f"- **{f.get('title', 'Issue')}** — `{file_path}`")
         lines.append("")
-    
-    lines.extend([
-        "---",
-        "*This review was performed by AI AppSec PR Reviewer. Please validate findings before taking action.*"
-    ])
-    
+
+    if not all_findings and not summary_findings and not resolved_findings:
+        lines.append("No security issues found in this change set.")
+        lines.append("")
+
+    lines.append("---")
+    lines.append("*AppSec PR Reviewer — validate findings before applying changes.*")
+
     return "\n".join(lines)
 
 
@@ -881,7 +841,7 @@ async def post_pr_approval(
         "X-GitHub-Api-Version": "2022-11-28"
     }
     
-    review_body = """## ✅ AI Security Review Complete
+    review_body = """## Security Review Complete
 
 No security vulnerabilities found in this PR.
 
@@ -1532,3 +1492,5 @@ async def get_installation_for_org(org_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Failed to get installation for org {org_id}: {e}")
         return None
+
+
