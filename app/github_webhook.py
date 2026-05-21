@@ -417,20 +417,51 @@ async def post_inline_comments_for_findings(
         
         # Build comment body
         risk_label = str(finding.get("risk", "MEDIUM")).upper()
+        severity_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(risk_label, "⚪")
         fingerprint = finding.get("fingerprint", "")
-        
-        body = f"""**[{risk_label}] Security Finding: {finding.get('title', 'Issue')}**
 
-{finding.get('description', '')}
+        body_parts = [
+            f"**Severity:** {severity_emoji} {risk_label} — {finding.get('title', 'Issue')}",
+            "",
+        ]
 
-**Impact:** {finding.get('impact', 'Unknown impact')}
+        description = finding.get('description', '')
+        if description:
+            body_parts.append(description)
+            body_parts.append("")
 
-**Recommendation:** {finding.get('recommendation', 'Fix the issue')}
+        impact = finding.get('impact', '')
+        if impact:
+            body_parts.append(f"**Impact:** {impact}")
+            body_parts.append("")
 
----
-*AI AppSec PR Reviewer* (fingerprint: `{fingerprint}`)
+        recommendation = finding.get('recommendation', '')
+        if recommendation:
+            body_parts.append(f"**Fix:** {recommendation}")
+            body_parts.append("")
 
-To dismiss: `/ignore {fingerprint}`"""
+        evidence = finding.get("evidence") or finding.get("code_snippet")
+        if evidence:
+            body_parts.append("**Evidence:**")
+            body_parts.append("```")
+            body_parts.append(evidence)
+            body_parts.append("```")
+            body_parts.append("")
+
+        example_fix = finding.get("example_fix") or finding.get("suggested_fix")
+        if example_fix:
+            body_parts.append("**Example Fix:**")
+            body_parts.append("```")
+            body_parts.append(example_fix)
+            body_parts.append("```")
+            body_parts.append("")
+
+        body_parts.append("---")
+        body_parts.append(f"*AI AppSec PR Reviewer* (fingerprint: `{fingerprint}`)")
+        body_parts.append("")
+        body_parts.append(f"To dismiss: `/ignore {fingerprint}`")
+
+        body = "\n".join(body_parts)
         
         # Get suggestion if available
         suggestion = finding.get("example_fix")
@@ -652,6 +683,7 @@ def _build_inline_comment_body(finding: Dict[str, Any]) -> str:
     """Build an inline review comment for a specific line."""
     severity = finding.get("severity") or finding.get("risk") or "MEDIUM"
     severity_str = _normalize_severity(severity)
+    severity_emoji = {"HIGH": "🔴", "MEDIUM": "🟠", "LOW": "🟡"}.get(severity_str, "⚪")
     title = finding.get("title", "Security Issue")
 
     file_path = finding.get("file_path", finding.get("file", "unknown"))
@@ -662,7 +694,7 @@ def _build_inline_comment_body(finding: Dict[str, Any]) -> str:
     status_text = "New" if is_new else "Still present"
 
     lines = [
-        f"**Severity: {severity_str}** — {title}",
+        f"**Severity:** {severity_emoji} {severity_str} — {title}",
         "",
     ]
 
@@ -687,6 +719,7 @@ def _build_inline_comment_body(finding: Dict[str, Any]) -> str:
 
     evidence = finding.get("evidence") or finding.get("code_snippet")
     if evidence:
+        lines.append("**Evidence:**")
         lines.append("```")
         lines.append(evidence)
         lines.append("```")
@@ -694,6 +727,7 @@ def _build_inline_comment_body(finding: Dict[str, Any]) -> str:
 
     example_fix = finding.get("example_fix") or finding.get("suggested_fix")
     if example_fix:
+        lines.append("**Example Fix:**")
         lines.append("```")
         lines.append(example_fix)
         lines.append("```")
