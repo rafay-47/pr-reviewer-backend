@@ -2986,29 +2986,6 @@ async def import_gitlab_repos(
     """Bulk import GitLab projects to repo configuration."""
     tenant.require_scope("admin:policy")
 
-    existing_configs = await list_repo_configs(tenant.org_id)
-    enabled_repo_names = {
-        config["repo_name"]
-        for config in existing_configs
-        if config.get("enabled")
-    }
-
-    selected_repos = set(import_request.repos)
-    repos_to_enable = [repo_name for repo_name in selected_repos if repo_name not in enabled_repo_names]
-
-    if repos_to_enable:
-        usage = await get_usage_status(tenant.org_id)
-        if usage.repos_limit != -1:
-            projected_enabled_count = usage.repos_used + len(repos_to_enable)
-            if projected_enabled_count > usage.repos_limit:
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        f"Repository limit reached ({usage.repos_used}/{usage.repos_limit}). "
-                        f"You selected {len(repos_to_enable)} new repositories, which exceeds your remaining quota."
-                    ),
-                )
-
     default_policy = {
         "mode": "advisory",
         "fail_on": "HIGH",
@@ -3192,32 +3169,6 @@ async def import_github_repos(
     from .github_app_auth import get_installation_token, InstallationNotFoundError
     from .github_client import GitHubClient
 
-    # Enforce repository limits before processing the import batch.
-    # Count semantics follow existing usage logic: enabled repos only.
-    existing_configs = await list_repo_configs(tenant.org_id)
-    enabled_repo_names = {
-        config["repo_name"]
-        for config in existing_configs
-        if config.get("enabled")
-    }
-
-    # Only repos not currently enabled consume additional quota.
-    selected_repos = set(import_request.repos)
-    repos_to_enable = [repo_name for repo_name in selected_repos if repo_name not in enabled_repo_names]
-
-    if repos_to_enable:
-        usage = await get_usage_status(tenant.org_id)
-        if usage.repos_limit != -1:
-            projected_enabled_count = usage.repos_used + len(repos_to_enable)
-            if projected_enabled_count > usage.repos_limit:
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        f"Repository limit reached ({usage.repos_used}/{usage.repos_limit}). "
-                        f"You selected {len(repos_to_enable)} new repositories, which exceeds your remaining quota."
-                    ),
-                )
-    
     results = []
     total_imported = 0
     total_failed = 0

@@ -89,7 +89,12 @@ def verify_webhook_token(payload: bytes, token: str, secret: str) -> bool:
 
 
 async def resolve_org_from_gitlab_repo(repo_name: str) -> Optional[str]:
-    """Resolve organization by GitLab repo config mapping."""
+    """Resolve org for a GitLab repo.
+
+    Resolution order:
+    1) Exact repo mapping in repo_configs (existing behavior)
+    2) Fallback to a single active GitLab connection org (non-imported repo support)
+    """
     try:
         client = get_supabase_client()
         result = await asyncio.to_thread(
@@ -98,7 +103,25 @@ async def resolve_org_from_gitlab_repo(repo_name: str) -> Optional[str]:
             ).eq("source", "gitlab").eq("enabled", True).limit(1).execute()
         )
         row = (result.data or [None])[0]
-        return row.get("org_id") if row else None
+        if row:
+            return row.get("org_id")
+
+        # Fallback: if exactly one active GitLab connection exists, use its org.
+        connections = await asyncio.to_thread(
+            lambda: client.table("gitlab_connections").select("org_id").eq(
+                "is_active", True
+            ).limit(20).execute()
+        )
+        rows = connections.data or []
+        org_ids = sorted({row.get("org_id") for row in rows if row and row.get("org_id")})
+        if len(org_ids) == 1:
+            return org_ids[0]
+        if len(org_ids) > 1:
+            logger.warning(
+                "Cannot resolve GitLab org for repo %s: multiple active org connections found",
+                repo_name,
+            )
+        return None
     except Exception as e:
         logger.error(f"Failed to resolve org for GitLab repo {repo_name}: {e}")
         return None
@@ -199,7 +222,7 @@ async def process_merge_request_webhook(
     )
 
     repo_config = await get_repo_config(org_id, repo_name)
-    if not repo_config or not repo_config.get("enabled", True):
+    if repo_config and not repo_config.get("enabled", True):
         return {
             "status": "skipped",
             "reason": "Repository is not enabled",

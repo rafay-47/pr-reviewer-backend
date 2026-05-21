@@ -544,15 +544,7 @@ async def get_usage_status(org_id: str, use_cache: bool = True) -> UsageStatus:
 
 
 async def check_can_add_repo(org_id: str) -> tuple[bool, Optional[str]]:
-    """Check if organization can add another repository."""
-    usage = await get_usage_status(org_id, use_cache=False)
-    
-    if usage.repos_limit == -1:  # Unlimited
-        return True, None
-    
-    if usage.repos_used >= usage.repos_limit:
-        return False, f"Repository limit reached ({usage.repos_used}/{usage.repos_limit}). Upgrade your plan to add more repositories."
-    
+    """Repository count limits are intentionally not enforced."""
     return True, None
 
 

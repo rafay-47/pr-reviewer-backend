@@ -1097,19 +1097,11 @@ async def process_pull_request_webhook(
         status="processing"
     )
     
-    # Check if repository is configured
+    # If a repo config exists and is explicitly disabled, skip review.
+    # Otherwise allow reviews for all repos under the installation.
     try:
         repo_config = await get_repo_config(org_id, repo_full_name)
-        if not repo_config:
-            logger.info(f"Repository {repo_full_name} not configured, skipping review")
-            return {
-                "status": "skipped",
-                "reason": "Repository not configured",
-                "repo": repo_full_name,
-                "pr_number": pr_number
-            }
-        
-        if not repo_config.get("enabled", True):
+        if repo_config and not repo_config.get("enabled", True):
             logger.info(f"Repository {repo_full_name} is disabled, skipping review")
             return {
                 "status": "skipped",
