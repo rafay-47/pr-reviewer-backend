@@ -44,7 +44,7 @@ async def test_get_dashboard_stats_counts_uppercase_severity():
 
 
 @pytest.mark.asyncio
-async def test_get_active_findings_stats_fallback():
+async def test_get_active_findings_stats_direct():
     mock_reviews = SimpleNamespace(
         data=[{"id": "r1", "review_time_ms": 200, "success": True, "should_block": False}],
         count=1,
@@ -58,15 +58,7 @@ async def test_get_active_findings_stats_fallback():
         count=3,
     )
 
-    # RPC fails, fallback queries run
-    rpc_mock = MagicMock()
-    rpc_mock.execute.side_effect = Exception("RPC not found")
-
-    mock_client = MagicMock()
-    mock_client.rpc.return_value = rpc_mock
-
-    with patch("app.database.get_supabase_client", return_value=mock_client), \
-         patch("app.database._execute_query", side_effect=[Exception("RPC failed"), mock_reviews, mock_findings]):
+    with patch("app.database._execute_query", side_effect=[mock_reviews, mock_findings]):
         stats = await get_active_findings_stats("org-1", 30)
 
     assert stats["total_reviews"] == 1
@@ -75,6 +67,39 @@ async def test_get_active_findings_stats_fallback():
     assert stats["medium_findings"] == 1
     assert stats["low_findings"] == 0
     assert stats["resolved_findings"] == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_resolve_pr_findings_fallback():
+    from app.database import auto_resolve_pr_findings
+    
+    mock_client = MagicMock()
+    # RPC fails
+    mock_client.rpc.side_effect = Exception("RPC not found")
+    
+    # Previous reviews query
+    mock_reviews_query = MagicMock()
+    mock_reviews_query.select.return_value.eq.return_value.eq.return_value.eq.return_value.neq.return_value.execute.return_value = SimpleNamespace(
+        data=[{"id": "prev-rev-1"}]
+    )
+    
+    # Findings update query
+    mock_findings_query = MagicMock()
+    mock_findings_query.update.return_value.eq.return_value.in_.return_value.eq.return_value.execute.return_value = SimpleNamespace(
+        data=[{"id": "f1", "status": "resolved"}, {"id": "f2", "status": "resolved"}]
+    )
+    
+    def mock_table(name):
+        if name == "reviews":
+            return mock_reviews_query
+        return mock_findings_query
+
+    mock_client.table.side_effect = mock_table
+
+    with patch("app.database.get_supabase_client", return_value=mock_client):
+        resolved_count = await auto_resolve_pr_findings("org-1", "owner/repo", 5, "current-rev-2")
+
+    assert resolved_count == 2
 
 
 @pytest.mark.asyncio

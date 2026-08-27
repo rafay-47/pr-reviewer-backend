@@ -1270,20 +1270,6 @@ async def get_active_findings_stats(org_id: str, days: int = 30) -> dict:
     """
     client = get_supabase_client()
     
-    # Try RPC function if present
-    try:
-        result = await _execute_query(
-            client.rpc("get_active_findings_dashboard_stats", {
-                "p_org_id": org_id,
-                "p_days": days
-            })
-        )
-        if result and result.data:
-            return result.data
-    except Exception as e:
-        logger.warning(f"RPC get_active_findings_dashboard_stats failed: {e}")
-    
-    # Fallback: query tables directly for accurate counts
     try:
         from datetime import datetime, timedelta
         time_ago = (datetime.utcnow() - timedelta(days=days)).isoformat()
@@ -2051,10 +2037,34 @@ async def auto_resolve_pr_findings(
             'p_pr_number': pr_number,
             'p_review_id': review_id
         }).execute()
-        
-        return result.data if result.data else 0
+        if result and result.data is not None:
+            return result.data
     except Exception as e:
-        logger.error(f"Error auto-resolving PR findings: {e}")
+        logger.warning(f"RPC auto_resolve_pr_findings failed (falling back to direct query): {e}")
+    
+    # Direct query fallback
+    try:
+        reviews_res = client.table("reviews").select("id").eq(
+            "org_id", org_id
+        ).eq("repo_name", repo_name).eq("pr_number", pr_number).neq("id", review_id).execute()
+        
+        if not reviews_res or not reviews_res.data:
+            return 0
+            
+        review_ids = [r["id"] for r in reviews_res.data if r.get("id")]
+        if not review_ids:
+            return 0
+            
+        update_res = client.table("findings").update({
+            "status": "resolved",
+            "resolution_method": "clean_pr",
+            "resolved_reason": "PR is clean / fixed",
+            "resolved_at": datetime.utcnow().isoformat(),
+        }).eq("org_id", org_id).in_("review_id", review_ids).eq("status", "open").execute()
+        
+        return len(update_res.data) if update_res and update_res.data else 0
+    except Exception as e:
+        logger.error(f"Error auto-resolving PR findings in fallback: {e}")
         return 0
 
 
