@@ -71,8 +71,17 @@ async def test_import_github_repos_rejects_over_quota_batch():
         plan_name="Free",
     )
 
+    mock_db = MagicMock()
+    mock_db.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = SimpleNamespace(
+        data=[{"installation_id": 12345}]
+    )
+
     with (
+        patch("app.database.get_supabase_client", return_value=mock_db),
+        patch("app.github_app_auth.get_installation_token", new=AsyncMock(return_value=("gh-token", None))),
+        patch("app.github_client.GitHubClient"),
         patch("app.database.list_repo_configs", new=AsyncMock(return_value=[])),
+        patch("app.main.check_can_add_repo", new=AsyncMock(return_value=(False, "Repository limit reached"))),
         patch("app.main.get_usage_status", new=AsyncMock(return_value=usage)),
         patch("app.main.upsert_repo_config", new=AsyncMock()) as mock_upsert,
     ):
@@ -90,7 +99,18 @@ async def test_import_github_repos_allows_existing_enabled_repos_at_limit():
     tenant = TenantContext(org_id="org-1", token_scopes=["admin:policy"])
     request = GitHubImportRequest(repos=["org/existing-repo"])
 
+    mock_db = MagicMock()
+    mock_db.table.return_value.select.return_value.eq.return_value.eq.return_value.order.return_value.limit.return_value.execute.return_value = SimpleNamespace(
+        data=[{"installation_id": 12345}]
+    )
+    mock_gh = MagicMock()
+    mock_gh.get_repo = AsyncMock(return_value=SimpleNamespace(default_branch="main"))
+    mock_gh.ensure_required_status_check = AsyncMock(return_value=True)
+
     with (
+        patch("app.database.get_supabase_client", return_value=mock_db),
+        patch("app.github_app_auth.get_installation_token", new=AsyncMock(return_value=("gh-token", None))),
+        patch("app.github_client.GitHubClient", return_value=mock_gh),
         patch(
             "app.database.list_repo_configs",
             new=AsyncMock(return_value=[{"repo_name": "org/existing-repo", "enabled": True}]),

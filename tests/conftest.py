@@ -15,6 +15,8 @@ def mock_env_vars():
         "LLM_API_KEY": "test-api-key-not-real",
         "API_AUTH_TOKEN": "",  # Disable auth for tests
         "LOG_LEVEL": "WARNING",
+        "SUPABASE_URL": "https://test.supabase.co",
+        "SUPABASE_SERVICE_KEY": "test-service-key",
     }):
         yield
 

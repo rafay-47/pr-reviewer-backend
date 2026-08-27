@@ -1003,48 +1003,48 @@ async def get_dashboard_stats(org_id: str, days: int = 30) -> dict:
     client = get_supabase_client()
     
     try:
-        # Get total reviews within time period
         from datetime import datetime, timedelta
         time_ago = (datetime.utcnow() - timedelta(days=days)).isoformat()
         reviews_query = client.table("reviews").select(
-            "id, review_time_ms, success, should_block", count="exact"
+            "id, review_time_ms, success, should_block, findings_count, high_count, medium_count, low_count", count="exact"
         ).eq("org_id", org_id).gte("created_at", time_ago)
 
         findings_query = client.table("findings").select(
-            "severity, status", count="exact"
+            "id, risk, severity, status, created_at", count="exact"
         ).eq("org_id", org_id)
 
         reviews_result, findings_result = await asyncio.gather(
             _execute_query(reviews_query),
             _execute_query(findings_query),
         )
-        total_reviews = reviews_result.count if hasattr(reviews_result, 'count') else 0
+        reviews_data = reviews_result.data or []
+        findings_data = findings_result.data or []
+
+        total_reviews = reviews_result.count if hasattr(reviews_result, 'count') and reviews_result.count is not None else len(reviews_data)
         
         # Calculate review metrics
-        review_times = [r.get("review_time_ms", 0) for r in (reviews_result.data or []) if r.get("review_time_ms")]
+        review_times = [r.get("review_time_ms", 0) for r in reviews_data if r.get("review_time_ms")]
         avg_review_time_ms = sum(review_times) / len(review_times) if review_times else 0
-        success_count = sum(1 for r in (reviews_result.data or []) if r.get("success"))
+        success_count = sum(1 for r in reviews_data if r.get("success"))
         success_rate = (success_count / total_reviews * 100) if total_reviews > 0 else 0
-        blocked_count = sum(1 for r in (reviews_result.data or []) if r.get("should_block"))
+        blocked_count = sum(1 for r in reviews_data if r.get("should_block"))
         
-        # Get findings counts by severity
-        total_findings = findings_result.count if hasattr(findings_result, 'count') else 0
+        total_findings = findings_result.count if hasattr(findings_result, 'count') and findings_result.count is not None else len(findings_data)
         
-        # Count by severity
         high_findings = 0
         medium_findings = 0
         low_findings = 0
         resolved_findings = 0
         
-        for finding in (findings_result.data or []):
-            severity = finding.get("severity", "medium")
-            status = finding.get("status", "open")
+        for finding in findings_data:
+            severity = str(finding.get("risk") or finding.get("severity") or "MEDIUM").upper()
+            status = str(finding.get("status") or "open").lower()
             
-            if severity in ["critical", "high"]:
+            if severity in ["CRITICAL", "HIGH"]:
                 high_findings += 1
-            elif severity == "medium":
+            elif severity == "MEDIUM":
                 medium_findings += 1
-            elif severity == "low":
+            elif severity == "LOW":
                 low_findings += 1
             
             if status in ["resolved", "false_positive", "accepted_risk", "wont_fix"]:
@@ -1063,7 +1063,6 @@ async def get_dashboard_stats(org_id: str, days: int = 30) -> dict:
         }
     except Exception as e:
         logger.warning(f"Error fetching dashboard stats for org {org_id}: {e}")
-        # Return safe defaults
         return {
             "total_reviews": 0,
             "total_findings": 0,
@@ -1077,72 +1076,95 @@ async def get_dashboard_stats(org_id: str, days: int = 30) -> dict:
         }
 
 
-async def get_findings_by_category(org_id: str) -> list[dict]:
+async def get_findings_by_category(org_id: str, days: int = 30) -> list[dict]:
     """Get findings grouped by category."""
     client = get_supabase_client()
     
     try:
         result = await _execute_query(
-            client.table("findings").select("category, severity").eq("org_id", org_id)
+            client.table("findings").select("category, risk, severity, status").eq("org_id", org_id)
         )
         
         if not result.data:
             return []
         
         # Group by category
-        categories = {}
+        categories: dict[str, dict] = {}
         for finding in result.data:
-            category = finding.get("category", "unknown")
-            severity = finding.get("severity", "medium")
+            category = (finding.get("category") or "other").lower()
+            severity = str(finding.get("risk") or finding.get("severity") or "MEDIUM").upper()
             
             if category not in categories:
                 categories[category] = {"category": category, "count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0}
             
             categories[category]["count"] += 1
-            if severity in ["critical", "high", "medium", "low"]:
-                categories[category][severity] += 1
+            if severity in ["CRITICAL", "HIGH"]:
+                categories[category]["high"] += 1
+            elif severity == "MEDIUM":
+                categories[category]["medium"] += 1
+            elif severity == "LOW":
+                categories[category]["low"] += 1
         
-        # Convert to list format with proper structure
         return list(categories.values())
     except Exception as e:
         logger.warning(f"Error fetching findings by category for org {org_id}: {e}")
         return []
 
 
-async def get_top_risky_repos(org_id: str, limit: int = 5) -> list[dict]:
-    """Get top repositories by number of findings."""
+async def get_top_risky_repos(org_id: str, days: int = 30, limit: int = 10) -> list[dict]:
+    """Get top repositories ranked by risk score based on reviews and findings."""
     client = get_supabase_client()
     
-    # Get all findings grouped by repo
-    result = client.table("findings").select("repo_name, severity").eq("org_id", org_id).execute()
-    
-    if not result.data:
+    try:
+        # Query reviews for this organization
+        result = await _execute_query(
+            client.table("reviews").select(
+                "repo_name, findings_count, high_count, medium_count, low_count"
+            ).eq("org_id", org_id)
+        )
+        
+        if not result.data:
+            return []
+        
+        # Group by repo
+        repos: dict[str, dict] = {}
+        for review in result.data:
+            repo = review.get("repo_name") or "unknown"
+            if repo not in repos:
+                repos[repo] = {
+                    "repo_name": repo,
+                    "review_count": 0,
+                    "total_findings": 0,
+                    "high_findings": 0,
+                    "medium_findings": 0,
+                    "low_findings": 0,
+                    "risk_score": 0.0,
+                }
+            
+            repos[repo]["review_count"] += 1
+            repos[repo]["total_findings"] += review.get("findings_count", 0) or 0
+            repos[repo]["high_findings"] += review.get("high_count", 0) or 0
+            repos[repo]["medium_findings"] += review.get("medium_count", 0) or 0
+            repos[repo]["low_findings"] += review.get("low_count", 0) or 0
+        
+        # Calculate risk scores
+        for repo_info in repos.values():
+            high = repo_info["high_findings"]
+            medium = repo_info["medium_findings"]
+            low = repo_info["low_findings"]
+            raw_score = (high * 25) + (medium * 10) + (low * 2)
+            repo_info["risk_score"] = min(100.0, float(raw_score))
+        
+        sorted_repos = sorted(
+            repos.values(),
+            key=lambda x: (x["risk_score"], x["high_findings"], x["total_findings"]),
+            reverse=True
+        )
+        
+        return sorted_repos[:limit]
+    except Exception as e:
+        logger.warning(f"Error fetching top risky repos for org {org_id}: {e}")
         return []
-    
-    # Group by repo
-    repos = {}
-    for finding in result.data:
-        repo = finding.get("repo_name", "unknown")
-        severity = finding.get("severity", "medium")
-        
-        if repo not in repos:
-            repos[repo] = {"total": 0, "critical": 0, "high": 0}
-        
-        repos[repo]["total"] += 1
-        if severity in ["critical", "high"]:
-            repos[repo][severity] += 1
-    
-    # Sort by critical/high count, then total
-    sorted_repos = sorted(
-        repos.items(),
-        key=lambda x: (x[1]["critical"] + x[1]["high"], x[1]["total"]),
-        reverse=True
-    )
-    
-    return [
-        {"repo_name": repo, **counts}
-        for repo, counts in sorted_repos[:limit]
-    ]
 
 
 async def get_review_trend(org_id: str, days: int = 30) -> list[dict]:
@@ -1150,14 +1172,15 @@ async def get_review_trend(org_id: str, days: int = 30) -> list[dict]:
     client = get_supabase_client()
     
     try:
-        # Get reviews from last N days
+        from collections import defaultdict
+        from datetime import datetime, timedelta
         start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
         reviews_query = client.table("reviews").select("created_at, id").eq(
             "org_id", org_id
         ).gte("created_at", start_date)
 
         findings_query = client.table("findings").select(
-            "created_at, severity, review_id"
+            "created_at, risk, severity, review_id"
         ).eq("org_id", org_id).gte("created_at", start_date)
 
         reviews_result, findings_result = await asyncio.gather(
@@ -1165,25 +1188,22 @@ async def get_review_trend(org_id: str, days: int = 30) -> list[dict]:
             _execute_query(findings_query),
         )
         
-        from collections import defaultdict
-        
-        # Group reviews by day
         daily_reviews = defaultdict(int)
         for review in (reviews_result.data or []):
-            date_str = review["created_at"][:10]  # YYYY-MM-DD
-            daily_reviews[date_str] += 1
+            date_str = str(review.get("created_at", ""))[:10]
+            if date_str:
+                daily_reviews[date_str] += 1
         
-        # Group findings by day and severity
         daily_findings = defaultdict(int)
         daily_high_findings = defaultdict(int)
         for finding in (findings_result.data or []):
-            date_str = finding["created_at"][:10]  # YYYY-MM-DD
-            daily_findings[date_str] += 1
-            severity = finding.get("severity", "medium")
-            if severity in ["critical", "high"]:
-                daily_high_findings[date_str] += 1
+            date_str = str(finding.get("created_at", ""))[:10]
+            if date_str:
+                daily_findings[date_str] += 1
+                severity = str(finding.get("risk") or finding.get("severity") or "MEDIUM").upper()
+                if severity in ["CRITICAL", "HIGH"]:
+                    daily_high_findings[date_str] += 1
         
-        # Fill in missing days and build trend
         trend = []
         for i in range(days):
             date = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -1194,9 +1214,7 @@ async def get_review_trend(org_id: str, days: int = 30) -> list[dict]:
                 "high_count": daily_high_findings.get(date, 0)
             })
         
-        # Reverse to get chronological order
         trend.reverse()
-        
         return trend
     except Exception as e:
         logger.warning(f"Error fetching review trend for org {org_id}: {e}")
@@ -1248,12 +1266,11 @@ async def get_recent_webhook_events(org_id: str, limit: int = 50) -> list[dict]:
 async def get_active_findings_stats(org_id: str, days: int = 30) -> dict:
     """Get statistics for active (non-resolved) findings.
     
-    Queries the findings table directly for accurate real-time counts,
-    rather than using cached counts from the reviews table.
+    Queries the findings and reviews tables directly for accurate real-time counts.
     """
     client = get_supabase_client()
     
-    # Use the new RPC function that queries findings table directly
+    # Try RPC function if present
     try:
         result = await _execute_query(
             client.rpc("get_active_findings_dashboard_stats", {
@@ -1261,27 +1278,37 @@ async def get_active_findings_stats(org_id: str, days: int = 30) -> dict:
                 "p_days": days
             })
         )
-        if result.data:
+        if result and result.data:
             return result.data
     except Exception as e:
         logger.warning(f"RPC get_active_findings_dashboard_stats failed: {e}")
     
-    # Fallback: query findings table directly for accurate counts
+    # Fallback: query tables directly for accurate counts
     try:
-        # Get total reviews from reviews table
-        reviews_query = client.table("reviews").select("id", count="exact").eq("org_id", org_id)
+        from datetime import datetime, timedelta
+        time_ago = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        
+        reviews_query = client.table("reviews").select(
+            "id, review_time_ms, success, should_block", count="exact"
+        ).eq("org_id", org_id).gte("created_at", time_ago)
 
         findings_query = client.table("findings").select(
-            "id, severity, status"
+            "id, risk, severity, status, created_at", count="exact"
         ).eq("org_id", org_id)
 
-        reviews_result, result = await asyncio.gather(
+        reviews_result, findings_result = await asyncio.gather(
             _execute_query(reviews_query),
             _execute_query(findings_query),
         )
-        total_reviews = reviews_result.count if hasattr(reviews_result, 'count') else 0
+        reviews_data = reviews_result.data or []
+        findings_data = findings_result.data or []
 
-        # Get active findings counts directly from findings table
+        total_reviews = reviews_result.count if hasattr(reviews_result, 'count') and reviews_result.count is not None else len(reviews_data)
+        review_times = [r.get("review_time_ms", 0) for r in reviews_data if r.get("review_time_ms")]
+        avg_review_time_ms = sum(review_times) / len(review_times) if review_times else 0
+        success_count = sum(1 for r in reviews_data if r.get("success"))
+        success_rate = (success_count / total_reviews * 100) if total_reviews > 0 else 0
+        blocked_count = sum(1 for r in reviews_data if r.get("should_block"))
         
         stats = {
             "total_reviews": total_reviews,
@@ -1289,28 +1316,26 @@ async def get_active_findings_stats(org_id: str, days: int = 30) -> dict:
             "high_findings": 0,
             "medium_findings": 0,
             "low_findings": 0,
-            "avg_review_time_ms": 0,
-            "success_rate": 0,
-            "blocked_count": 0,
+            "avg_review_time_ms": avg_review_time_ms,
+            "success_rate": success_rate,
+            "blocked_count": blocked_count,
+            "resolved_findings": 0,
         }
         
-        if result.data:
-            for finding in result.data:
-                # Only count findings with status 'open' or null (default to open)
-                status = finding.get("status", "open")
-                if status == "open":
-                    stats["total_findings"] += 1
-                    # Check for severity in multiple possible field names
-                    # The findings table stores it as 'severity' but API might use 'risk'
-                    severity = finding.get("severity") or finding.get("risk", "medium")
-                    # Normalize severity to lowercase for comparison
-                    severity_lower = str(severity).lower()
-                    if severity_lower in ["critical", "high"]:
-                        stats["high_findings"] += 1
-                    elif severity_lower == "medium":
-                        stats["medium_findings"] += 1
-                    elif severity_lower == "low":
-                        stats["low_findings"] += 1
+        for finding in findings_data:
+            status = str(finding.get("status") or "open").lower()
+            severity = str(finding.get("risk") or finding.get("severity") or "MEDIUM").upper()
+            
+            if status in ["open", "null", "none"] or not finding.get("status"):
+                stats["total_findings"] += 1
+                if severity in ["CRITICAL", "HIGH"]:
+                    stats["high_findings"] += 1
+                elif severity == "MEDIUM":
+                    stats["medium_findings"] += 1
+                elif severity == "LOW":
+                    stats["low_findings"] += 1
+            elif status in ["resolved", "false_positive", "accepted_risk", "wont_fix"]:
+                stats["resolved_findings"] += 1
         
         return stats
     except Exception as e:
@@ -1324,37 +1349,42 @@ async def get_active_findings_stats(org_id: str, days: int = 30) -> dict:
             "avg_review_time_ms": 0,
             "success_rate": 0,
             "blocked_count": 0,
-            "resolved_findings": 0,  # Added missing field
+            "resolved_findings": 0,
         }
 
 
-async def get_active_findings_by_category(org_id: str, limit: int = 10) -> list[dict]:
+async def get_active_findings_by_category(org_id: str, days: int = 30, limit: int = 10) -> list[dict]:
     """Get active (open) findings grouped by category."""
     client = get_supabase_client()
     
     try:
-        # Filter by status='open' - findings with status 'open' or null are considered active
         result = await _execute_query(
-            client.table("findings").select("category, severity, status").eq("org_id", org_id).or_("status.eq.open,status.is.null")
+            client.table("findings").select("category, risk, severity, status").eq("org_id", org_id)
         )
         
         if not result.data:
             return []
         
-        # Group by category
-        categories = {}
+        categories: dict[str, dict] = {}
         for finding in result.data:
-            category = finding.get("category", "unknown")
-            severity = finding.get("severity", "medium")
+            status = str(finding.get("status") or "open").lower()
+            if status not in ["open", "null", "none"] and finding.get("status"):
+                continue
+                
+            category = (finding.get("category") or "other").lower()
+            severity = str(finding.get("risk") or finding.get("severity") or "MEDIUM").upper()
             
             if category not in categories:
                 categories[category] = {"category": category, "count": 0, "critical": 0, "high": 0, "medium": 0, "low": 0}
             
             categories[category]["count"] += 1
-            if severity in ["critical", "high", "medium", "low"]:
-                categories[category][severity] += 1
+            if severity in ["CRITICAL", "HIGH"]:
+                categories[category]["high"] += 1
+            elif severity == "MEDIUM":
+                categories[category]["medium"] += 1
+            elif severity == "LOW":
+                categories[category]["low"] += 1
         
-        # Sort by total count and limit
         sorted_categories = sorted(
             categories.values(),
             key=lambda x: x["count"],
@@ -1378,21 +1408,68 @@ async def get_active_findings_trend(org_id: str, days: int = 30) -> list[dict]:
                 "p_days": days
             })
         )
+        if result and result.data:
+            normalized = []
+            for item in result.data:
+                normalized.append({
+                    "date": item.get("date", ""),
+                    "review_count": item.get("review_count", item.get("count", 0)),
+                    "findings_count": item.get("findings_count", 0),
+                    "high_count": item.get("high_count", 0)
+                })
+            return normalized
+    except Exception as e:
+        logger.warning(f"RPC get_active_findings_trend failed (falling back to direct query): {e}")
+    
+    # Fallback: query reviews and findings directly
+    try:
+        from collections import defaultdict
+        from datetime import datetime, timedelta
+        start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
         
-        if not result.data:
-            return []
+        reviews_query = client.table("reviews").select("created_at, id").eq(
+            "org_id", org_id
+        ).gte("created_at", start_date)
+
+        findings_query = client.table("findings").select(
+            "created_at, risk, severity, status"
+        ).eq("org_id", org_id).gte("created_at", start_date)
+
+        reviews_result, findings_result = await asyncio.gather(
+            _execute_query(reviews_query),
+            _execute_query(findings_query),
+        )
         
-        # Normalize the data to ensure consistent field names
-        normalized = []
-        for item in result.data:
-            normalized.append({
-                "date": item.get("date", ""),
-                "review_count": item.get("review_count", item.get("count", 0)),
-                "findings_count": item.get("findings_count", 0),
-                "high_count": item.get("high_count", 0)
+        daily_reviews = defaultdict(int)
+        for review in (reviews_result.data or []):
+            date_str = str(review.get("created_at", ""))[:10]
+            if date_str:
+                daily_reviews[date_str] += 1
+        
+        daily_findings = defaultdict(int)
+        daily_high_findings = defaultdict(int)
+        for finding in (findings_result.data or []):
+            status = str(finding.get("status") or "open").lower()
+            if status in ["open", "null", "none"] or not finding.get("status"):
+                date_str = str(finding.get("created_at", ""))[:10]
+                if date_str:
+                    daily_findings[date_str] += 1
+                    severity = str(finding.get("risk") or finding.get("severity") or "MEDIUM").upper()
+                    if severity in ["CRITICAL", "HIGH"]:
+                        daily_high_findings[date_str] += 1
+        
+        trend = []
+        for i in range(days):
+            date = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+            trend.append({
+                "date": date,
+                "review_count": daily_reviews.get(date, 0),
+                "findings_count": daily_findings.get(date, 0),
+                "high_count": daily_high_findings.get(date, 0)
             })
         
-        return normalized
+        trend.reverse()
+        return trend
     except Exception as e:
         logger.error(f"Error getting active findings trend: {e}")
         return []
@@ -1410,10 +1487,16 @@ async def get_top_risky_repos_active(org_id: str, days: int = 30, limit: int = 1
                 "p_limit": limit
             })
         )
-        
-        return result.data if result.data else []
+        if result and result.data:
+            return result.data
     except Exception as e:
-        logger.error(f"Error getting top risky repos: {e}")
+        logger.warning(f"RPC get_top_risky_repos_active failed (falling back to direct query): {e}")
+    
+    # Fallback: query reviews and calculate risk scores
+    try:
+        return await get_top_risky_repos(org_id, days, limit)
+    except Exception as e:
+        logger.error(f"Error getting top risky repos active: {e}")
         return []
 
 
