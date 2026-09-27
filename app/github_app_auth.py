@@ -278,3 +278,52 @@ async def get_github_app_info(settings: Optional[Settings] = None) -> dict:
     except Exception as e:
         logger.error(f"Failed to get GitHub App info: {e}")
         raise
+
+
+async def get_installation_details(
+    installation_id: int,
+    settings: Optional[Settings] = None
+) -> Optional[dict]:
+    """
+    Get GitHub App installation details directly from GitHub API using App JWT.
+
+    Args:
+        installation_id: The GitHub App installation ID
+        settings: Application settings
+
+    Returns:
+        Installation details dictionary or None if not found / error
+    """
+    if settings is None:
+        settings = get_settings()
+
+    if not settings.github_app_id or not settings.github_app_private_key:
+        logger.warning("GitHub App credentials not configured, cannot fetch installation details")
+        return None
+
+    try:
+        app_jwt = generate_app_jwt(settings)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.github.com/app/installations/{installation_id}",
+                headers={
+                    "Authorization": f"Bearer {app_jwt}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=20.0
+            )
+
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                logger.warning(f"Installation {installation_id} not found on GitHub")
+                return None
+            else:
+                logger.warning(f"GitHub API returned {response.status_code} for installation {installation_id}")
+                return None
+
+    except Exception as e:
+        logger.error(f"Failed to fetch installation details for {installation_id}: {e}")
+        return None

@@ -4617,6 +4617,49 @@ async def create_organization_endpoint(
     # Check if org already exists
     existing = await get_organization_by_slug(org_slug)
     if existing:
+        # Check if this organization was auto-created from a direct GitHub App installation
+        # and has no owner assigned yet in org_members
+        from .database import get_supabase_client
+        client = get_supabase_client()
+        members = client.table("org_members").select("id").eq("org_id", existing["id"]).execute()
+        
+        if not members.data:
+            logger.info(f"User {user.email} is claiming auto-created organization {existing['id']} ('{org_slug}')")
+            client.table("org_members").insert({
+                "org_id": existing["id"],
+                "user_id": user.user_id,
+                "role": "owner"
+            }).execute()
+            
+            cur_settings = existing.get("settings") or {}
+            cur_settings["auto_created"] = False
+            cur_settings["claimed_by_user_id"] = user.user_id
+            client.table("organizations").update({
+                "settings": cur_settings,
+                "name": request.org_name,
+                "updated_at": datetime.utcnow().isoformat()
+            }).eq("id", existing["id"]).execute()
+            
+            from .database import get_cicd_token, create_api_token
+            cicd_token_data = await get_cicd_token(existing["id"])
+            cicd_token = None
+            if not cicd_token_data:
+                cicd_token, cicd_token_data = await create_api_token(
+                    org_id=existing["id"],
+                    name="Default API Token",
+                    token_type="cicd",
+                    created_by=user.user_id,
+                    expires_in_days=0
+                )
+                
+            return CreateOrgResponse(
+                org_id=existing["id"],
+                org_name=request.org_name,
+                org_slug=existing["slug"],
+                api_token=cicd_token,
+                token_prefix=cicd_token_data["prefix"] if cicd_token_data else None,
+            )
+
         raise HTTPException(
             status_code=409,
             detail=f"Organization with slug '{org_slug}' already exists. Please choose a different name."
@@ -5465,6 +5508,8 @@ async def github_webhook_endpoint(request: Request):
         return await _handle_pull_request_webhook(payload, settings, record_webhook_event)
     elif event_type == "installation":
         return await _handle_installation_webhook(payload)
+    elif event_type == "installation_repositories":
+        return await _handle_installation_repositories_webhook(payload, settings)
     elif event_type == "issue_comment":
         return await _handle_issue_comment_webhook(payload, settings)
     elif event_type == "pull_request_review_comment":
@@ -5591,7 +5636,8 @@ async def _handle_installation_webhook(payload):
     from .github_webhook import (
         process_installation_created,
         process_installation_deleted,
-        process_installation_suspend
+        process_installation_suspend,
+        process_installation_unsuspend,
     )
     
     action = payload.get("action")
@@ -5603,6 +5649,8 @@ async def _handle_installation_webhook(payload):
             result = await process_installation_deleted(payload)
         elif action == "suspend":
             result = await process_installation_suspend(payload)
+        elif action == "unsuspend":
+            result = await process_installation_unsuspend(payload)
         else:
             logger.info(f"Ignoring installation action: {action}")
             return {"received": True, "status": "ignored", "reason": f"Action '{action}' not processed"}
@@ -5615,6 +5663,80 @@ async def _handle_installation_webhook(payload):
     except Exception as e:
         logger.error(f"Unexpected installation webhook error: {e}")
         raise HTTPException(status_code=500, detail="Webhook processing failed")
+
+
+async def _handle_installation_repositories_webhook(payload, settings):
+    """Handle installation_repositories webhook events (repos added or removed)."""
+    from .github_webhook import resolve_org_from_installation
+    from .database import upsert_repo_config, get_supabase_client
+    
+    action = payload.get("action")
+    installation = payload.get("installation", {})
+    installation_id = installation.get("id")
+    
+    if not installation_id:
+        return {"received": True, "status": "ignored", "reason": "Missing installation ID"}
+        
+    org_id = await resolve_org_from_installation(
+        installation_id,
+        fallback_account_info=installation.get("account"),
+        settings=settings
+    )
+    if not org_id:
+        logger.warning(f"Could not resolve org for installation_repositories on {installation_id}")
+        return {"received": True, "status": "ignored", "reason": "Organization not found"}
+        
+    repos_added = payload.get("repositories_added", [])
+    repos_removed = payload.get("repositories_removed", [])
+    
+    client = get_supabase_client()
+    for repo in repos_added:
+        full_name = repo.get("full_name")
+        if full_name:
+            try:
+                await upsert_repo_config(
+                    org_id=org_id,
+                    repo_name=full_name,
+                    policy={
+                        "mode": "advisory",
+                        "fail_on": "HIGH",
+                        "min_risk": "LOW",
+                        "min_confidence": "LOW",
+                        "max_findings": 10,
+                        "rules": {
+                            "injection": True,
+                            "secrets": True,
+                            "auth": True,
+                            "ssrf": True,
+                            "crypto": True,
+                            "deserialization": True
+                        }
+                    },
+                    enabled=True,
+                    source="github",
+                    github_repo_id=str(repo.get("id")) if repo.get("id") else None
+                )
+            except Exception as e:
+                logger.warning(f"Failed to add repo {full_name}: {e}")
+                
+    for repo in repos_removed:
+        full_name = repo.get("full_name")
+        if full_name:
+            try:
+                client.table("repo_configs").update({
+                    "enabled": False,
+                    "updated_at": datetime.utcnow().isoformat()
+                }).eq("org_id", org_id).eq("repo_name", full_name).execute()
+            except Exception as e:
+                logger.warning(f"Failed to disable removed repo {full_name}: {e}")
+                
+    return {
+        "received": True,
+        "status": "processed",
+        "action": action,
+        "added_count": len(repos_added),
+        "removed_count": len(repos_removed)
+    }
 
 
 async def _handle_issue_comment_webhook(payload: dict, settings):
@@ -5671,7 +5793,11 @@ async def _handle_issue_comment_webhook(payload: dict, settings):
         return {"received": True, "status": "error", "reason": "Missing required fields"}
     
     # Resolve org from installation
-    org_id = await resolve_org_from_installation(installation_id)
+    org_id = await resolve_org_from_installation(
+        installation_id,
+        fallback_account_info=repository.get("owner"),
+        settings=settings
+    )
     if not org_id:
         logger.warning(f"Could not resolve org for installation {installation_id}")
         return {"received": True, "status": "error", "reason": "Organization not found"}
@@ -5983,7 +6109,11 @@ async def _handle_pull_request_review_thread(payload: dict, settings):
         return {"received": True, "status": "error", "reason": "Missing required fields"}
     
     # Resolve org from installation
-    org_id = await resolve_org_from_installation(installation_id)
+    org_id = await resolve_org_from_installation(
+        installation_id,
+        fallback_account_info=repository.get("owner"),
+        settings=settings
+    )
     if not org_id:
         logger.warning(f"Could not resolve org for installation {installation_id}")
         return {"received": True, "status": "error", "reason": "Organization not found"}

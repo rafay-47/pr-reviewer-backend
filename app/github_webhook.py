@@ -20,7 +20,7 @@ import httpx
 from fastapi import Request, HTTPException
 
 from .config import Settings, get_settings
-from .github_app_auth import get_installation_token, get_installation_for_repo
+from .github_app_auth import get_installation_token, get_installation_for_repo, get_installation_details
 from .database import get_repo_config, get_supabase_client
 from .models import RepoPolicy
 
@@ -898,32 +898,231 @@ No security vulnerabilities found in this PR.
         return response.json()
 
 
-async def resolve_org_from_installation(installation_id: int) -> Optional[str]:
+async def get_or_create_org_for_github_account(
+    account_login: str,
+    account_id: int,
+    account_type: str = "User",
+) -> str:
     """
-    Find organization ID from GitHub App installation ID.
+    Find or auto-create an organization for a GitHub account.
+    
+    Used when a GitHub App is installed directly via GitHub without using the web app.
+    
+    Args:
+        account_login: GitHub username or organization name
+        account_id: GitHub numeric account ID
+        account_type: 'User' or 'Organization'
+        
+    Returns:
+        Organization ID (UUID string)
+    """
+    client = get_supabase_client()
+    
+    # 1. Check if an organization already exists for this GitHub account ID in settings
+    try:
+        result = client.table("organizations").select("id").filter(
+            "settings->>github_account_id", "eq", str(account_id)
+        ).limit(1).execute()
+        if result and result.data:
+            org_id = result.data[0]["id"]
+            logger.info(f"Found existing org {org_id} by github_account_id {account_id}")
+            return str(org_id)
+    except Exception as e:
+        logger.debug(f"Filter by settings->github_account_id failed: {e}")
+
+    # 2. Check if an organization exists matching the slug
+    base_slug = re.sub(r'[^a-z0-9-]', '', (account_login or "").lower().replace(' ', '-'))
+    base_slug = re.sub(r'-+', '-', base_slug).strip('-')
+    if len(base_slug) < 2:
+        base_slug = f"gh-{account_id}"
+
+    try:
+        from .database import get_organization_by_slug
+        existing_org = await get_organization_by_slug(base_slug)
+        if existing_org:
+            org_id = existing_org["id"]
+            inst_check = client.table("github_app_installations").select("id").eq(
+                "org_id", org_id
+            ).eq("is_active", True).limit(1).execute()
+            
+            # If it has no active installation, attach to this org
+            if not inst_check.data:
+                logger.info(f"Reusing existing org {org_id} ('{base_slug}') with no active installation")
+                try:
+                    cur_settings = existing_org.get("settings") or {}
+                    cur_settings.update({
+                        "github_account_id": account_id,
+                        "github_login": account_login,
+                        "account_type": account_type
+                    })
+                    client.table("organizations").update({
+                        "settings": cur_settings,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("id", org_id).execute()
+                except Exception as update_err:
+                    logger.warning(f"Failed to update org settings: {update_err}")
+                return str(org_id)
+    except Exception as e:
+        logger.warning(f"Error checking org by slug {base_slug}: {e}")
+
+    # 3. Create a new organization for this GitHub account
+    org_slug = base_slug
+    attempt = 0
+    while True:
+        try:
+            from .database import get_organization_by_slug
+            existing = await get_organization_by_slug(org_slug)
+            if not existing:
+                break
+            attempt += 1
+            org_slug = f"{base_slug}-gh{attempt}"
+        except Exception:
+            break
+
+    logger.info(f"Auto-creating organization for GitHub account '{account_login}' with slug '{org_slug}'")
+    org_settings = {
+        "github_account_id": account_id,
+        "github_login": account_login,
+        "account_type": account_type,
+        "auto_created": True,
+        "created_from": "github_installation"
+    }
+
+    try:
+        insert_result = client.table("organizations").insert({
+            "name": account_login or f"GitHub-{account_id}",
+            "slug": org_slug,
+            "plan_id": "free",
+            "settings": org_settings
+        }).execute()
+        
+        if not insert_result.data:
+            raise RuntimeError(f"Failed to insert organization for {account_login}")
+            
+        org = insert_result.data[0]
+        org_id = org["id"]
+        
+        from .database import _set_cached_organization, create_api_token
+        _set_cached_organization(org_id, org)
+        
+        # Generate default CI/CD API token for this org
+        try:
+            await create_api_token(
+                org_id=org_id,
+                name="Default API Token",
+                token_type="cicd",
+                created_by=None,
+                expires_in_days=0
+            )
+        except Exception as token_err:
+            logger.warning(f"Failed to create default API token for org {org_id}: {token_err}")
+            
+        # Create default free subscription record
+        try:
+            client.table("subscriptions").insert({
+                "org_id": org_id,
+                "plan_id": "free",
+                "status": "active"
+            }).execute()
+        except Exception as sub_err:
+            logger.debug(f"Subscription insert skipped/failed: {sub_err}")
+            
+        logger.info(f"Successfully auto-provisioned organization {org_id} for GitHub account '{account_login}'")
+        return str(org_id)
+        
+    except Exception as e:
+        logger.error(f"Failed to create organization for GitHub account {account_login}: {e}")
+        raise
+
+
+async def resolve_org_from_installation(
+    installation_id: int,
+    fallback_account_info: Optional[Dict[str, Any]] = None,
+    settings: Optional[Settings] = None
+) -> Optional[str]:
+    """
+    Find organization ID from GitHub App installation ID, or auto-provision if missing.
     
     This queries the database to find which organization has this installation.
+    If the installation is not found (e.g. installed via GitHub installation/new without web app),
+    it dynamically fetches installation info from GitHub and auto-provisions the organization.
     
     Args:
         installation_id: GitHub App installation ID
+        fallback_account_info: Optional account info from webhook payload if GitHub API is unreachable
+        settings: Application settings
         
     Returns:
-        Organization ID or None if not found
+        Organization ID or None if not found and cannot be provisioned
     """
     try:
         client = get_supabase_client()
-        result = client.table("github_app_installations").select("org_id").eq(
+        result = client.table("github_app_installations").select("org_id, is_active").eq(
             "installation_id", installation_id
         ).maybe_single().execute()
         
-        if result and result.data:
-            return result.data.get("org_id")
+        if result and result.data and result.data.get("org_id"):
+            org_id = result.data.get("org_id")
+            # If deactivated, reactivate
+            if not result.data.get("is_active"):
+                try:
+                    client.table("github_app_installations").update({
+                        "is_active": True,
+                        "updated_at": datetime.utcnow().isoformat()
+                    }).eq("installation_id", installation_id).execute()
+                except Exception as react_err:
+                    logger.warning(f"Failed to reactivate installation {installation_id}: {react_err}")
+            return org_id
         
-        logger.warning(f"No organization found for installation {installation_id}")
-        return None
+        logger.info(
+            f"No organization found in DB for installation {installation_id}. "
+            f"Attempting discovery and auto-provisioning..."
+        )
+        
+        # JIT auto-provisioning: fetch installation details from GitHub
+        install_data = await get_installation_details(installation_id, settings)
+        account = (install_data or {}).get("account", {})
+        
+        account_login = account.get("login")
+        account_type = account.get("type", "User")
+        account_id = account.get("id")
+        repository_selection = (install_data or {}).get("repository_selection", "all")
+        permissions = (install_data or {}).get("permissions", {})
+        events = (install_data or {}).get("events", [])
+        
+        # Use fallback if GitHub API didn't return account info
+        if not account_login and fallback_account_info:
+            account_login = fallback_account_info.get("login") or fallback_account_info.get("account_login")
+            account_id = fallback_account_info.get("id") or fallback_account_info.get("account_id") or installation_id
+            account_type = fallback_account_info.get("type") or fallback_account_info.get("account_type", "User")
+            
+        if not account_login:
+            account_login = f"gh-install-{installation_id}"
+        if not account_id:
+            account_id = installation_id
+            
+        org_id = await get_or_create_org_for_github_account(
+            account_login=account_login,
+            account_id=int(account_id),
+            account_type=account_type
+        )
+        
+        await store_github_app_installation(
+            org_id=org_id,
+            installation_id=installation_id,
+            account_login=account_login,
+            account_type=account_type,
+            account_id=int(account_id),
+            repository_selection=repository_selection,
+            permissions=permissions,
+            events=events
+        )
+        
+        logger.info(f"Successfully auto-provisioned org {org_id} for installation {installation_id}")
+        return org_id
         
     except Exception as e:
-        logger.error(f"Failed to resolve org from installation {installation_id}: {e}")
+        logger.error(f"Failed to resolve or auto-provision org from installation {installation_id}: {e}")
         return None
 
 
@@ -1068,8 +1267,13 @@ async def process_pull_request_webhook(
     if not installation_id:
         raise ValueError("Missing installation ID in webhook payload")
     
-    # Resolve organization from installation
-    org_id = await resolve_org_from_installation(installation_id)
+    # Resolve organization from installation (auto-provisions if installed without web app)
+    repo_owner = repository.get("owner", {})
+    org_id = await resolve_org_from_installation(
+        installation_id=installation_id,
+        fallback_account_info=repo_owner,
+        settings=settings
+    )
     
     if not org_id:
         logger.warning(f"Could not resolve organization for installation {installation_id}")
@@ -1325,7 +1529,8 @@ async def process_installation_created(payload: Dict[str, Any]) -> Dict[str, Any
     Handle installation.created webhook event.
     
     This is called when a user installs the GitHub App on their account or organization.
-    We need to wait for them to link it to their organization via the API.
+    Auto-provisions an organization if needed and saves the installation in backend,
+    enabling automatic PR reviews without requiring prior web app setup.
     
     Args:
         payload: Webhook payload
@@ -1336,22 +1541,80 @@ async def process_installation_created(payload: Dict[str, Any]) -> Dict[str, Any
     installation = payload.get("installation", {})
     installation_id = installation.get("id")
     account = installation.get("account", {})
+    repositories = payload.get("repositories", [])
     
     if not installation_id:
         raise ValueError("Missing installation ID in payload")
     
+    account_login = account.get("login") or f"gh-install-{installation_id}"
+    account_type = account.get("type", "User")
+    account_id = account.get("id") or installation_id
+    repository_selection = installation.get("repository_selection", "all")
+    permissions = installation.get("permissions", {})
+    events = installation.get("events", [])
+    
     logger.info(
         f"GitHub App installed: installation_id={installation_id}, "
-        f"account={account.get('login')} ({account.get('type')})"
+        f"account={account_login} ({account_type})"
     )
     
-    # We don't link to org here - the user must do that via API
-    # Just log that we received the installation
+    # Auto-resolve or create organization
+    org_id = await get_or_create_org_for_github_account(
+        account_login=account_login,
+        account_id=int(account_id),
+        account_type=account_type
+    )
+    
+    # Store installation in database
+    await store_github_app_installation(
+        org_id=org_id,
+        installation_id=installation_id,
+        account_login=account_login,
+        account_type=account_type,
+        account_id=int(account_id),
+        repository_selection=repository_selection,
+        permissions=permissions,
+        events=events
+    )
+    
+    # Auto-register repo configs for repositories included in payload
+    if repositories and isinstance(repositories, list):
+        from .database import upsert_repo_config
+        for repo_item in repositories:
+            full_name = repo_item.get("full_name")
+            if full_name:
+                try:
+                    await upsert_repo_config(
+                        org_id=org_id,
+                        repo_name=full_name,
+                        policy={
+                            "mode": "advisory",
+                            "fail_on": "HIGH",
+                            "min_risk": "LOW",
+                            "min_confidence": "LOW",
+                            "max_findings": 10,
+                            "rules": {
+                                "injection": True,
+                                "secrets": True,
+                                "auth": True,
+                                "ssrf": True,
+                                "crypto": True,
+                                "deserialization": True
+                            }
+                        },
+                        enabled=True,
+                        source="github",
+                        github_repo_id=str(repo_item.get("id")) if repo_item.get("id") else None
+                    )
+                except Exception as repo_err:
+                    logger.warning(f"Failed to auto-register repo config for {full_name}: {repo_err}")
+    
     return {
-        "status": "logged",
+        "status": "saved",
         "installation_id": installation_id,
-        "account": account.get("login"),
-        "message": "Installation recorded. Awaiting organization link."
+        "org_id": org_id,
+        "account": account_login,
+        "message": "GitHub App installation saved and linked successfully"
     }
 
 
@@ -1441,6 +1704,48 @@ async def process_installation_suspend(payload: Dict[str, Any]) -> Dict[str, Any
     }
 
 
+async def process_installation_unsuspend(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle installation.unsuspend webhook event.
+    
+    This is called when GitHub unsuspends the App installation.
+    
+    Args:
+        payload: Webhook payload
+        
+    Returns:
+        Processing result
+    """
+    installation = payload.get("installation", {})
+    installation_id = installation.get("id")
+    
+    if not installation_id:
+        raise ValueError("Missing installation ID in payload")
+    
+    try:
+        client = get_supabase_client()
+        result = client.table("github_app_installations").update({
+            "is_active": True,
+            "suspended_at": None,
+            "suspended_by": None,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("installation_id", installation_id).execute()
+        
+        if result.data:
+            logger.info(f"Unsuspended GitHub App installation {installation_id}")
+        else:
+            logger.warning(f"Installation {installation_id} not found for unsuspend")
+            
+    except Exception as e:
+        logger.error(f"Failed to unsuspend installation {installation_id}: {e}")
+    
+    return {
+        "status": "unsuspended",
+        "installation_id": installation_id,
+        "message": "Installation unsuspended"
+    }
+
+
 async def store_github_app_installation(
     org_id: str,
     installation_id: int,
@@ -1454,8 +1759,8 @@ async def store_github_app_installation(
     """
     Store or update GitHub App installation information.
     
-    This is called via API when a user links their GitHub App installation
-    to their organization.
+    This is called via API or webhook when a GitHub App installation is created
+    or linked to an organization.
     
     Args:
         org_id: Organization ID
@@ -1470,23 +1775,48 @@ async def store_github_app_installation(
     Returns:
         Stored installation record
     """
+    norm_type = "Organization" if str(account_type).lower() == "organization" else "User"
+
     try:
         client = get_supabase_client()
         
-        # Use the upsert function from migration
-        result = client.rpc(
-            "upsert_github_app_installation",
-            {
-                "p_org_id": org_id,
-                "p_installation_id": installation_id,
-                "p_account_login": account_login,
-                "p_account_type": account_type,
-                "p_account_id": account_id,
-                "p_repository_selection": repository_selection,
-                "p_permissions": permissions or {},
-                "p_events": events or []
+        # Try the upsert RPC function first
+        try:
+            result = client.rpc(
+                "upsert_github_app_installation",
+                {
+                    "p_org_id": org_id,
+                    "p_installation_id": installation_id,
+                    "p_account_login": account_login,
+                    "p_account_type": norm_type,
+                    "p_account_id": account_id,
+                    "p_repository_selection": repository_selection,
+                    "p_permissions": permissions or {},
+                    "p_events": events or []
+                }
+            ).execute()
+        except Exception as rpc_err:
+            logger.warning(
+                f"RPC upsert_github_app_installation failed ({rpc_err}), falling back to direct table upsert"
+            )
+            table_payload = {
+                "org_id": org_id,
+                "installation_id": installation_id,
+                "account_login": account_login,
+                "account_type": norm_type,
+                "account_id": account_id,
+                "repository_selection": repository_selection,
+                "permissions": permissions or {},
+                "events": events or [],
+                "is_active": True,
+                "suspended_at": None,
+                "suspended_by": None,
+                "updated_at": datetime.utcnow().isoformat()
             }
-        ).execute()
+            result = client.table("github_app_installations").upsert(
+                table_payload,
+                on_conflict="installation_id"
+            ).execute()
         
         logger.info(
             f"Linked GitHub App installation {installation_id} to organization {org_id}"
