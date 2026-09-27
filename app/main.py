@@ -3194,6 +3194,19 @@ async def import_github_repos(
     if import_request.default_policy:
         default_policy = import_request.default_policy.model_dump()
 
+    # Check subscription repository limits
+    existing_configs = await list_repo_configs(tenant.org_id)
+    existing_enabled = {c["repo_name"] for c in existing_configs if c.get("enabled")}
+    new_repos_to_enable = [r for r in import_request.repos if r not in existing_enabled]
+    
+    if new_repos_to_enable:
+        usage = await get_usage_status(tenant.org_id)
+        if not usage.within_limits or len(new_repos_to_enable) > usage.repos_remaining:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Repository limit reached. You can only import {usage.repos_remaining} more repositories on your current plan.",
+            )
+
     # Use GitHub App installation token for automatic branch protection setup.
     required_check_context = "ai-appsec/high-vuln-gate"
     supabase_client = get_supabase_client()
