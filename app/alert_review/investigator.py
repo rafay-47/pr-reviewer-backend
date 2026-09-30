@@ -190,6 +190,12 @@ class AIInvestigator:
 
         # Parse supporting evidence items
         supporting_items = []
+        def _safe_weight(val: Any) -> float:
+            try:
+                return max(0.5, min(5.0, abs(float(val))))
+            except (ValueError, TypeError):
+                return 1.0
+
         for idx, item in enumerate(parsed.get("supporting_evidence", [])):
             cat = item.get("category", "SINK_EXPLOITABILITY")
             try:
@@ -206,7 +212,7 @@ class AIInvestigator:
                 code_reference=item.get("code_reference"),
                 file_path=item.get("file_path"),
                 line_numbers=item.get("line_numbers"),
-                weight=float(item.get("weight", 1.0))
+                weight=_safe_weight(item.get("weight", 1.0))
             ))
 
         # Parse opposing evidence items
@@ -227,7 +233,7 @@ class AIInvestigator:
                 code_reference=item.get("code_reference"),
                 file_path=item.get("file_path"),
                 line_numbers=item.get("line_numbers"),
-                weight=float(item.get("weight", 1.0))
+                weight=_safe_weight(item.get("weight", 1.0))
             ))
 
         # Determination mapping

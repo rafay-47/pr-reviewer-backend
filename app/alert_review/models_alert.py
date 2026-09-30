@@ -13,7 +13,7 @@ Defines all data models across the 6 pipeline stages:
 from enum import Enum
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timezone
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class DeterminationType(str, Enum):
@@ -136,7 +136,16 @@ class EvidenceItem(BaseModel):
     code_reference: Optional[str] = Field(default=None, description="Exact code snippet cited")
     file_path: Optional[str] = None
     line_numbers: Optional[List[int]] = None
-    weight: float = Field(default=1.0, ge=0.5, le=5.0, description="Significance weight")
+    weight: float = Field(default=1.0, description="Significance weight")
+
+    @field_validator('weight', mode='before')
+    @classmethod
+    def sanitize_weight(cls, v: Any) -> float:
+        try:
+            val = abs(float(v))
+            return max(0.5, min(5.0, val))
+        except (ValueError, TypeError):
+            return 1.0
 
 
 class InvestigatorAssessment(BaseModel):
