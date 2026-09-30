@@ -310,6 +310,11 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "Content-Type", "Location"],
 )
 
+# Include AI Code-Scanning Alert Review Service router
+from .alert_review.router import router as alert_review_router
+app.include_router(alert_review_router)
+
+
 
 @app.middleware("http")
 async def request_timing_middleware(request: Request, call_next):
@@ -5519,6 +5524,11 @@ async def github_webhook_endpoint(request: Request):
     # Handle different event types
     if event_type == "pull_request":
         return await _handle_pull_request_webhook(payload, settings, record_webhook_event)
+    elif event_type == "code_scanning_alert":
+        from .alert_review.github_app_service import GitHubAppAlertHandler
+        handler = GitHubAppAlertHandler(settings=settings)
+        result = await handler.process_webhook_event(payload)
+        return {"received": True, **result}
     elif event_type == "installation":
         return await _handle_installation_webhook(payload)
     elif event_type == "installation_repositories":

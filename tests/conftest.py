@@ -10,6 +10,8 @@ from unittest.mock import patch
 @pytest.fixture(autouse=True)
 def mock_env_vars():
     """Mock environment variables for testing."""
+    from app.config import get_settings
+    get_settings.cache_clear()
     with patch.dict(os.environ, {
         "LLM_PROVIDER": "claude",
         "LLM_API_KEY": "test-api-key-not-real",
@@ -18,7 +20,9 @@ def mock_env_vars():
         "SUPABASE_URL": "https://test.supabase.co",
         "SUPABASE_SERVICE_KEY": "test-service-key",
     }):
+        get_settings.cache_clear()
         yield
+        get_settings.cache_clear()
 
 
 @pytest.fixture
