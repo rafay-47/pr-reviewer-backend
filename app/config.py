@@ -107,6 +107,7 @@ class Settings(BaseSettings):
     github_app_id: Optional[str] = os.getenv("GITHUB_APP_ID")
     github_app_private_key: Optional[str] = os.getenv("GITHUB_APP_PRIVATE_KEY")
     github_app_webhook_secret: Optional[str] = os.getenv("GITHUB_APP_WEBHOOK_SECRET")
+    enable_pr_diff_review: bool = os.getenv("ENABLE_PR_DIFF_REVIEW", "true").lower() == "true"
 
     # GitLab App Configuration
     gitlab_app_client_id: Optional[str] = os.getenv("GITLAB_APP_CLIENT_ID")

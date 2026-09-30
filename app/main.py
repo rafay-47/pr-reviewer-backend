@@ -5464,6 +5464,14 @@ async def stripe_webhook_endpoint(request: Request):
     summary="GitHub App webhook handler",
     include_in_schema=False,  # Hide from public API docs
 )
+@app.post(
+    "/webhook/github",
+    include_in_schema=False,
+)
+@app.post(
+    "/webhooks/github",
+    include_in_schema=False,
+)
 async def github_webhook_endpoint(request: Request):
     """
     Handle GitHub App webhook events for automatic PR reviews.
@@ -5528,6 +5536,11 @@ async def github_webhook_endpoint(request: Request):
         from .alert_review.github_app_service import GitHubAppAlertHandler
         handler = GitHubAppAlertHandler(settings=settings)
         result = await handler.process_webhook_event(payload)
+        return {"received": True, **result}
+    elif event_type == "check_run":
+        from .alert_review.github_app_service import GitHubAppAlertHandler
+        handler = GitHubAppAlertHandler(settings=settings)
+        result = await handler.process_check_run_event(payload)
         return {"received": True, **result}
     elif event_type == "installation":
         return await _handle_installation_webhook(payload)
@@ -5612,6 +5625,11 @@ async def _handle_pull_request_webhook(payload, settings, record_webhook_event):
     """Handle pull request webhook events."""
     from .github_webhook import process_pull_request_webhook
     
+    # Check if legacy PR diff review is enabled
+    if not getattr(settings, "enable_pr_diff_review", True):
+        logger.info("PR diff review is disabled (ENABLE_PR_DIFF_REVIEW=false). Skipping PR diff review.")
+        return {"received": True, "status": "ignored", "reason": "PR diff review disabled"}
+
     # Only process specific actions
     action = payload.get("action")
     if action not in ["opened", "synchronize", "reopened"]:

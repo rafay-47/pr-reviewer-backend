@@ -267,3 +267,62 @@ async def test_github_app_dismissal_request_disputed_true_positive():
     pr_comment_body = handler.post_pull_request_comment.call_args[1]["report"].markdown_report
     assert "Disputed by AI AppSec Reviewer" in pr_comment_body
     assert "dev-lead" in pr_comment_body
+
+
+@pytest.mark.asyncio
+async def test_pr_diff_review_can_be_disabled():
+    """Verify that when enable_pr_diff_review is False, pull_request events are ignored."""
+    from app.main import _handle_pull_request_webhook
+    from app.config import Settings
+
+    settings = Settings(enable_pr_diff_review=False)
+    payload = {
+        "action": "opened",
+        "pull_request": {"number": 1, "draft": False}
+    }
+    result = await _handle_pull_request_webhook(payload, settings, AsyncMock())
+    assert result["status"] == "ignored"
+    assert result["reason"] == "PR diff review disabled"
+
+
+@pytest.mark.asyncio
+async def test_check_run_codeql_triage():
+    """Verify that completed CodeQL check_run events fetch alerts and review them."""
+    service = AlertReviewService()
+    handler = GitHubAppAlertHandler(service=service)
+    handler.get_token_for_payload = AsyncMock(return_value="mock-token")
+    handler.process_webhook_event = AsyncMock(return_value={"status": "processed", "determination": "TRUE_POSITIVE"})
+
+    # Mock httpx GET for code scanning alerts
+    from unittest.mock import MagicMock
+    with patch("httpx.AsyncClient.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [{
+            "number": 77,
+            "rule": {"id": "js/sql-injection", "description": "SQL Injection"},
+            "most_recent_instance": {
+                "commit_sha": "abc1234",
+                "location": {"path": "test2.js", "start_line": 15}
+            }
+        }]
+        mock_get.return_value = mock_resp
+
+        payload = {
+            "action": "completed",
+            "check_run": {
+                "id": 110067985142,
+                "name": "Code scanning results / CodeQL",
+                "head_sha": "abc1234",
+                "conclusion": "failure"
+            },
+            "repository": {"full_name": "abdul-rafay-1/temp1"},
+            "installation": {"id": 12345}
+        }
+
+        result = await handler.process_check_run_event(payload)
+        assert result["status"] == "processed"
+        assert result["alerts_reviewed"] == 1
+        handler.process_webhook_event.assert_called_once()
+
+
