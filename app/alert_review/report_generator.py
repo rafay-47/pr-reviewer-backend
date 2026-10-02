@@ -19,6 +19,8 @@ from .models_alert import (
     InvestigatorAssessment,
     VerificationReport,
     DeterminationType,
+    RecommendationType,
+    CodeReference,
     ConfidenceScore,
     RemediationPlan,
     TriageReport,
@@ -37,16 +39,16 @@ def _generate_remediation(
     if determination == DeterminationType.TRUE_POSITIVE:
         return RemediationPlan(
             action_type="CODE_FIX",
-            suggested_fix_code=f"// Example remediation for {alert.rule_id} at {alert.primary_location.file_path}:{alert.primary_location.line_number}\n// Use parameterized inputs or validate against a strict schema.",
-            fix_explanation="The vulnerability is exploitable. Replace the vulnerable direct interpolation/execution with parameterized interfaces.",
+            suggested_fix_code=f"// Example remediation for {alert.rule_id} at {alert.primary_location.file_path}:{alert.primary_location.line_number}\n// Use parameterized queries or strict schema validation.",
+            fix_explanation="The vulnerability is verified and exploitable. Replace raw string interpolation with parameterized queries or validated types.",
             dismissal_reason=None,
             dismissal_comment=None,
             codeql_modeling_recommendation=None
         )
     elif determination == DeterminationType.FALSE_POSITIVE:
         dismissal_text = (
-            f"AI Alert Review: Validated as False Positive ({investigator.proposed_determination.value}). "
-            f"Evidence shows taint is neutralized or unreachable. Rule: {alert.rule_id}."
+            f"AI Alert Review: Validated False Positive ({investigator.proposed_determination.value}). "
+            f"Evidence verifies that input is parameterized or safely neutralized. Rule: {alert.rule_id}."
         )
         return RemediationPlan(
             action_type="DISMISS_ALERT",
@@ -56,14 +58,23 @@ def _generate_remediation(
             dismissal_comment=dismissal_text,
             codeql_modeling_recommendation=(
                 f"To suppress similar findings automatically in CodeQL, define a dataflow barrier sanitizer "
-                f"in your CodeQL model or query suite for {alert.rule_id}."
+                f"in your CodeQL model for {alert.rule_id}."
             )
+        )
+    elif determination == DeterminationType.INSUFFICIENT_EVIDENCE:
+        return RemediationPlan(
+            action_type="REQUEST_EVIDENCE",
+            suggested_fix_code=None,
+            fix_explanation="Insufficient evidence to verify whether input is safely handled. Awaiting developer clarification in PR.",
+            dismissal_reason=None,
+            dismissal_comment=None,
+            codeql_modeling_recommendation=None
         )
     else:
         return RemediationPlan(
             action_type="MANUAL_INVESTIGATION",
             suggested_fix_code=None,
-            fix_explanation="Manual investigation required by AppSec team to inspect runtime behavior or external dependencies.",
+            fix_explanation="AppSec review required to inspect runtime behavior or external architecture.",
             dismissal_reason=None,
             dismissal_comment=None,
             codeql_modeling_recommendation=None
@@ -76,97 +87,127 @@ def _build_markdown_report(
     confidence: ConfidenceScore,
     investigator: InvestigatorAssessment,
     verifier: VerificationReport,
-    remediation: RemediationPlan
+    remediation: RemediationPlan,
+    developer_feedback: Optional[str] = None,
+    is_stale: bool = False,
+    appsec_decision: str = "PENDING"
 ) -> str:
-    """Render rich Markdown report for GitHub."""
-    # Banner
-    if determination == DeterminationType.TRUE_POSITIVE:
-        badge = f"🚨 **VERDICT: TRUE POSITIVE** (Confidence: {confidence.score:.0%} - {confidence.qualitative_level})"
-    elif determination == DeterminationType.FALSE_POSITIVE:
-        badge = f"🛡️ **VERDICT: FALSE POSITIVE** (Confidence: {confidence.score:.0%} - {confidence.qualitative_level})"
-    elif determination == DeterminationType.ACCEPTABLE_RISK:
-        badge = f"⚠️ **VERDICT: ACCEPTABLE RISK** (Confidence: {confidence.score:.0%} - {confidence.qualitative_level})"
-    else:
-        badge = f"🔍 **VERDICT: SUSPICIOUS / NEEDS HUMAN REVIEW** (Confidence: {confidence.score:.0%} - {confidence.qualitative_level})"
-
+    """Render structured, unified Markdown comment for the PR."""
     lines = []
-    lines.append(f"## 🤖 AI Code Scanning Alert Review")
-    lines.append(f"\n{badge}\n")
-    lines.append(f"**Alert ID:** `{alert.alert_id}` | **Rule:** `{alert.rule_id}` ({alert.rule_name}) | **Severity:** `{alert.severity.value}`")
-    if alert.cwe_ids:
-        lines.append(f"**CWE References:** {', '.join(alert.cwe_ids)}")
-    lines.append(f"**Location:** `{alert.primary_location.file_path}:{alert.primary_location.line_number}`")
-
-    lines.append(f"\n### 📋 Executive Summary")
-    lines.append(confidence.explanation)
-
-    lines.append(f"\n### 🎯 Scanner Claim")
-    lines.append(f"> {alert.scanner_message}")
-
-    # Evidence Matrix
-    lines.append(f"\n### ⚖️ Evidence Matrix")
-
-    lines.append(f"\n#### Supporting Evidence (Indicating True Positive)")
-    if investigator.supporting_evidence:
-        lines.append("| ID | Category | Title | Code Reference |")
-        lines.append("| :--- | :--- | :--- | :--- |")
-        for item in investigator.supporting_evidence:
-            ref_snippet = f"`{item.code_reference[:45]}...`" if item.code_reference else "N/A"
-            lines.append(f"| {item.id} | `{item.category.value}` | **{item.title}**: {item.description} | {ref_snippet} |")
-    else:
-        lines.append("_No substantial supporting evidence found._")
-
-    lines.append(f"\n#### Opposing Evidence (Indicating False Positive / Mitigation)")
-    if investigator.opposing_evidence:
-        lines.append("| ID | Category | Title | Code Reference |")
-        lines.append("| :--- | :--- | :--- | :--- |")
-        for item in investigator.opposing_evidence:
-            ref_snippet = f"`{item.code_reference[:45]}...`" if item.code_reference else "N/A"
-            lines.append(f"| {item.id} | `{item.category.value}` | **{item.title}**: {item.description} | {ref_snippet} |")
-    else:
-        lines.append("_No substantial opposing evidence found._")
-
-    # Verification & Adversarial Challenges
-    lines.append(f"\n### 🔬 Adversarial Verification & Grounding")
-    lines.append(f"- **Grounding Score:** `{verifier.grounding_score:.0%}` (code references verified in source files)")
-    if verifier.ungrounded_claims:
-        lines.append(f"- ⚠️ **Ungrounded Citations:** {len(verifier.ungrounded_claims)} claims failed strict source verification.")
     
-    if verifier.challenges:
-        lines.append(f"\n<details><summary><b>Adversarial Challenges ({len(verifier.challenges)})</b></summary>\n")
-        for c in verifier.challenges:
-            status_icon = "⚠️ Bypass Found" if c.was_adversarial_counter_valid else "✅ Defended"
-            lines.append(f"- **{status_icon}**: {c.challenge_question}")
-            lines.append(f"  * *Counter-argument:* {c.counter_argument}")
-            lines.append(f"  * *Resolution:* {c.challenge_resolution}\n")
-        lines.append("</details>")
+    # 1. Unique Machine-readable anchor for in-place comment updates
+    lines.append(f"<!-- AI_CODEQL_ALERT_REVIEW:{alert.alert_id} -->")
 
-    # Limitations & Unknowns
-    if verifier.missing_context_flags:
-        lines.append(f"\n### ⚠️ Limitations & Unverified Assumptions")
-        for flag in verifier.missing_context_flags:
-            lines.append(f"- {flag}")
+    # 2. Extract alert number for clean title
+    alert_num = alert.alert_id.split("#")[-1] if "#" in alert.alert_id else alert.alert_id
 
-    # Actionable Remediation
-    lines.append(f"\n### 💡 Recommended Action")
-    if remediation.action_type == "DISMISS_ALERT":
-        lines.append(f"**Recommended GitHub Action:** Dismiss alert as **False Positive**.")
-        lines.append(f"```text\n{remediation.dismissal_comment}\n```")
-        if remediation.codeql_modeling_recommendation:
-            lines.append(f"\n> **CodeQL Modeling Tip:** {remediation.codeql_modeling_recommendation}")
-    elif remediation.action_type == "CODE_FIX":
-        lines.append(f"**Recommended GitHub Action:** Require code modification before merging.")
+    # 3. Assessment & Status Badges
+    if is_stale:
+        status_banner = "⚠️ **STATUS: STALE ASSESSMENT** (New commits pushed — waiting for updated CodeQL scan)"
+    elif determination == DeterminationType.TRUE_POSITIVE:
+        status_banner = f"🚨 **VERDICT: TRUE POSITIVE** | **ASSESSMENT: LIKELY VALID VULNERABILITY** ({confidence.qualitative_level} confidence: {confidence.score:.0%})"
+    elif determination == DeterminationType.FALSE_POSITIVE:
+        status_banner = f"🛡️ **VERDICT: FALSE POSITIVE** | **ASSESSMENT: LIKELY FALSE POSITIVE** ({confidence.qualitative_level} confidence: {confidence.score:.0%})"
+    elif determination == DeterminationType.INSUFFICIENT_EVIDENCE:
+        status_banner = f"❓ **ASSESSMENT: INSUFFICIENT EVIDENCE** ({confidence.qualitative_level} confidence: {confidence.score:.0%})"
+    elif determination == DeterminationType.ACCEPTABLE_RISK:
+        status_banner = f"⚠️ **VERDICT: ACCEPTABLE RISK** | **ASSESSMENT: ACCEPTABLE RISK** ({confidence.qualitative_level} confidence: {confidence.score:.0%})"
+    else:
+        status_banner = f"🔍 **VERDICT: SUSPICIOUS / NEEDS HUMAN REVIEW** | **ASSESSMENT: NEEDS APPSEC REVIEW** ({confidence.qualitative_level} confidence: {confidence.score:.0%})"
+
+    lines.append(f"### 🤖 AI AppSec Review — Alert #{alert_num}: `{alert.rule_id}`\n")
+    lines.append(f"{status_banner}\n")
+
+    # 4. Consolidated Review Card
+    short_commit = alert.commit_sha[:8] if alert.commit_sha else "HEAD"
+    lines.append(f"> **Alert Reference:** [{alert.repo}#{alert_num}]({alert.source_url or '#'})  ")
+    lines.append(f"> **Rule:** `{alert.rule_id}` ({alert.rule_name}) | **Severity:** `{alert.severity.value}`  ")
+    lines.append(f"> **Reviewed Commit:** `{short_commit}`  ")
+    lines.append(f"> **Location:** `{alert.primary_location.file_path}:{alert.primary_location.line_number}`  ")
+    lines.append(f"> **AppSec Dismissal Decision:** `{appsec_decision}` (AppSec holds final approval authority)  ")
+
+    # 5. Developer Action / Questions
+    lines.append("\n#### 👤 Developer Action Required:")
+    if determination == DeterminationType.INSUFFICIENT_EVIDENCE or investigator.developer_questions:
+        lines.append("**Please respond directly in this PR comment thread with evidence or answers to the following:**")
+        for q in (investigator.developer_questions or ["Where does input sanitization or parameter binding occur for this query?"]):
+            lines.append(f"- ❓ **{q}**")
+        if investigator.missing_evidence:
+            lines.append("\n*Missing context identified by AI:*")
+            for m in investigator.missing_evidence:
+                lines.append(f"  * `{m}`")
+    elif determination == DeterminationType.TRUE_POSITIVE:
+        lines.append("🔴 **Remediation Required:** Code changes needed before merge. Please parameterize inputs or apply strict schema validation.")
         if remediation.suggested_fix_code:
             lines.append(f"\n```suggestion\n{remediation.suggested_fix_code}\n```")
+    elif determination == DeterminationType.FALSE_POSITIVE:
+        lines.append("🟢 **No Developer Action Needed:** Finding appears to be a False Positive. Request dismissal on the alert if blocked; AppSec will review and record final decision.")
     else:
-        lines.append(f"**Recommended GitHub Action:** Escalate to Application Security Engineer for manual triage.")
+        lines.append("🟡 **Awaiting AppSec Review:** Manual review queued for the Application Security team.")
 
-    lines.append("\n---\n*Report generated by AI Alert Review Service (CodeQL Triage Engine).*")
+    # 6. Developer Justification Status (if response received)
+    if developer_feedback:
+        lines.append("\n#### 💬 Developer Feedback Received:")
+        lines.append(f"> \"{developer_feedback.strip()}\"")
+        if verifier.developer_evidence_verified:
+            lines.append("✅ **Developer Evidence Status:** Corroborated by repository code inspection.")
+        else:
+            lines.append("⚠️ **Developer Evidence Status:** Unverified verbal statement. Code verification required.")
+            if verifier.unverified_developer_claims:
+                for c in verifier.unverified_developer_claims:
+                    lines.append(f"  * {c}")
+
+    # 7. Collapsible Deep-Dive Details for AppSec Engineer
+    lines.append("\n<details>")
+    lines.append("<summary><b>🔍 AppSec Investigation Details & Evidence Matrix (Click to expand)</b></summary>\n")
+
+    lines.append(f"**Executive Summary:** {confidence.explanation}\n")
+    lines.append(f"**Scanner Claim:** {alert.scanner_message}\n")
+
+    # Dataflow hops
+    if alert.code_flows:
+        lines.append("##### 🌊 CodeQL Dataflow Trace:")
+        for flow in alert.code_flows:
+            for idx, node in enumerate(flow.nodes):
+                hop_type = node.step_type.upper()
+                lines.append(f"{idx+1}. `[{hop_type}]` `{node.file_path}:{node.line_number}` — {node.description or 'step'}")
+                if node.code_snippet:
+                    lines.append(f"   ```text\n   {node.code_snippet.strip()}\n   ```")
+        lines.append("")
+
+    # Evidence Matrix
+    lines.append("##### ⚖️ Evidence Matrix:")
+    if investigator.supporting_evidence:
+        lines.append("| ID | Category | Title & Finding | Cited Code |")
+        lines.append("| :--- | :--- | :--- | :--- |")
+        for item in investigator.supporting_evidence:
+            ref_str = item.code_reference or ""
+            snippet = f"`{ref_str[:40]}...`" if len(ref_str) > 40 else (f"`{ref_str}`" if ref_str else "N/A")
+            lines.append(f"| {item.id} | `{item.category.value}` | **{item.title}**: {item.description} | {snippet} |")
+    if investigator.opposing_evidence:
+        for item in investigator.opposing_evidence:
+            ref_str = item.code_reference or ""
+            snippet = f"`{ref_str[:40]}...`" if len(ref_str) > 40 else (f"`{ref_str}`" if ref_str else "N/A")
+            lines.append(f"| {item.id} | `{item.category.value}` | **{item.title}**: {item.description} | {snippet} |")
+
+    # Adversarial verification
+    lines.append(f"\n- **Code Grounding Ratio:** `{verifier.grounding_score:.0%}`")
+    if verifier.challenges:
+        lines.append("- **Adversarial Verifier Challenges:**")
+        for c in verifier.challenges:
+            icon = "⚠️ Counter Valid" if c.was_adversarial_counter_valid else "✅ Mitigated"
+            lines.append(f"  * **{icon}**: {c.challenge_question} — *{c.challenge_resolution}*")
+
+    lines.append("\n</details>")
+
+    lines.append("\n---")
+    lines.append("*Review powered by AI AppSec PR Reviewer. AppSec engineers retain exclusive dismissal authority.*")
+
     return "\n".join(lines)
 
 
 class ReportGenerator:
-    """Generates triage reports and handles automated GitHub alert updates."""
+    """Generates triage reports with human-in-the-loop governance."""
 
     def generate_report(
         self,
@@ -175,17 +216,32 @@ class ReportGenerator:
         investigator: InvestigatorAssessment,
         verifier: VerificationReport,
         determination: DeterminationType,
-        confidence: ConfidenceScore
+        confidence: ConfidenceScore,
+        developer_feedback: Optional[str] = None,
+        is_stale: bool = False,
+        appsec_decision: str = "PENDING",
+        pr_comment_id: Optional[int] = None
     ) -> TriageReport:
         """
         Produce a full TriageReport object.
         """
         remediation = _generate_remediation(alert, determination, investigator, verifier)
-        md_report = _build_markdown_report(alert, determination, confidence, investigator, verifier, remediation)
+        md_report = _build_markdown_report(
+            alert=alert,
+            determination=determination,
+            confidence=confidence,
+            investigator=investigator,
+            verifier=verifier,
+            remediation=remediation,
+            developer_feedback=developer_feedback,
+            is_stale=is_stale,
+            appsec_decision=appsec_decision
+        )
 
         exec_summary = (
             f"Alert {alert.alert_id} evaluated as {determination.value} "
-            f"with {confidence.score:.0%} confidence ({confidence.qualitative_level})."
+            f"with {confidence.score:.0%} confidence ({confidence.qualitative_level}). "
+            f"Recommendation: {investigator.recommendation.value}."
         )
 
         return TriageReport(
@@ -203,7 +259,16 @@ class ReportGenerator:
             verification_report=verifier,
             remediation=remediation,
             limitations=verifier.missing_context_flags,
-            markdown_report=md_report
+            markdown_report=md_report,
+            code_references=investigator.code_references,
+            verified_evidence=investigator.verified_evidence,
+            missing_evidence=investigator.missing_evidence,
+            developer_questions=investigator.developer_questions,
+            recommendation=investigator.recommendation,
+            appsec_decision=appsec_decision,
+            is_stale=is_stale,
+            pr_comment_id=pr_comment_id,
+            developer_feedback=developer_feedback
         )
 
     async def dismiss_github_alert(
@@ -216,30 +281,12 @@ class ReportGenerator:
         comment: str
     ) -> bool:
         """
-        Call GitHub API PATCH /repos/{owner}/{repo}/code-scanning/alerts/{alert_number}
-        to dismiss a false positive finding.
+        Strict AppSec governance enforcement:
+        The AI service NEVER automatically dismisses alerts in GitHub.
+        Dismissal authority belongs exclusively to human AppSec engineers.
         """
-        url = f"https://api.github.com/repos/{owner}/{repo}/code-scanning/alerts/{alert_number}"
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {github_token}",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        payload = {
-            "state": "dismissed",
-            "dismissed_reason": reason,
-            "dismissed_comment": comment[:280]  # GitHub comment limit
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.patch(url, headers=headers, json=payload)
-                if resp.status_code in (200, 204):
-                    logger.info(f"Successfully dismissed GitHub alert {owner}/{repo}#{alert_number}")
-                    return True
-                else:
-                    logger.warning(f"Failed to dismiss GitHub alert: {resp.status_code} - {resp.text}")
-                    return False
-        except Exception as e:
-            logger.error(f"Error dismissing GitHub alert: {e}")
-            return False
+        logger.warning(
+            f"Attempted automated dismissal on {owner}/{repo}#{alert_number} blocked by governance policy. "
+            "AI service operates in advisory mode; AppSec engineers hold exclusive dismissal authority."
+        )
+        return False

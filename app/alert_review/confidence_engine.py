@@ -16,6 +16,7 @@ from .models_alert import (
     InvestigatorAssessment,
     VerificationReport,
     DeterminationType,
+    RecommendationType,
     ConfidenceScore,
     EvidenceCategory,
 )
@@ -105,17 +106,27 @@ class ConfidenceEngine:
             final_det = DeterminationType.NEEDS_REVIEW
             determination_reason = f"Grounding score too low ({grounding_factor:.2f}). Evidence cites unverified code."
 
-        # Case B: Adversarial verifier proved a bypass against a proposed False Positive
+        # Case B: Insufficient evidence to determine safety -> Ask developer
+        elif (
+            investigator.proposed_determination == DeterminationType.INSUFFICIENT_EVIDENCE
+            or verifier.suggested_determination == DeterminationType.INSUFFICIENT_EVIDENCE
+            or investigator.recommendation == RecommendationType.REQUEST_EVIDENCE
+            or (len(investigator.missing_evidence) > 0 and investigator.proposed_determination != DeterminationType.TRUE_POSITIVE)
+        ):
+            final_det = DeterminationType.INSUFFICIENT_EVIDENCE
+            determination_reason = "Insufficient code context to verify defenses or parameter binding. Requesting developer evidence."
+
+        # Case C: Adversarial verifier proved a bypass against a proposed False Positive
         elif investigator.proposed_determination == DeterminationType.FALSE_POSITIVE and has_successful_bypass:
             final_det = DeterminationType.TRUE_POSITIVE
             determination_reason = "Investigator proposed False Positive, but adversarial verifier proved a bypass against the sanitizer."
 
-        # Case C: Consensus reached
+        # Case D: Consensus reached
         elif consensus:
             final_det = investigator.proposed_determination
             determination_reason = f"Full consensus between Investigator and Verifier on {final_det.value}."
 
-        # Case D: Disagreement between Investigator and Verifier
+        # Case E: Disagreement between Investigator and Verifier
         else:
             # If one is TRUE_POSITIVE and one is FALSE_POSITIVE without clear bypass, flag for human AppSec review
             final_det = DeterminationType.NEEDS_REVIEW

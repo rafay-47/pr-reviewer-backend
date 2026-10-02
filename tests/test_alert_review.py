@@ -21,6 +21,8 @@ from app.alert_review.models_alert import (
     CodeFlowNode,
     CodeFlowPath,
     DeterminationType,
+    RecommendationType,
+    CodeReference,
     EvidenceCategory,
     EvidenceDirection,
     EvidenceItem,
@@ -799,3 +801,145 @@ async def test_end_to_end_alert_review_service():
     assert "🚨 **VERDICT: TRUE POSITIVE**" in triage.markdown_report
     assert triage.remediation.action_type == "CODE_FIX"
     assert call_count == 2  # Stage 3 (Investigator) + Stage 4 (Verifier)
+
+
+@pytest.mark.asyncio
+async def test_decision_gate_insufficient_evidence_generates_questions():
+    """Verify that when context is incomplete, AI marks INSUFFICIENT_EVIDENCE and poses questions to developer."""
+    mock_inv_json = json.dumps({
+        "claim_summary": "Query uses custom database wrapper without visible parameterization",
+        "source_analysis": "req.params.id",
+        "propagation_analysis": "Passed to dbWrapper.execute",
+        "sink_analysis": "dbWrapper implementation not visible in context",
+        "defenses_analysis": "Unknown if dbWrapper binds parameters",
+        "proposed_determination": "INSUFFICIENT_EVIDENCE",
+        "recommendation": "request_evidence",
+        "preliminary_confidence": 0.65,
+        "code_references": [
+            {"path": "src/controllers/userController.js", "start_line": 25, "end_line": 28}
+        ],
+        "verified_evidence": ["Input reaches dbWrapper.execute"],
+        "missing_evidence": ["Implementation of dbWrapper.execute in lib/db.js"],
+        "developer_questions": [
+            "Does dbWrapper.execute bind query parameters or concatenate SQL strings?"
+        ],
+        "supporting_evidence": [],
+        "opposing_evidence": [],
+        "reasoning": "Cannot determine exploitability without database wrapper implementation."
+    })
+
+    mock_ver_json = json.dumps({
+        "grounding_score": 1.0,
+        "ungrounded_claims": [],
+        "consensus_with_investigator": True,
+        "suggested_determination": "INSUFFICIENT_EVIDENCE",
+        "challenges": [],
+        "missing_context_flags": ["Database wrapper definition missing"],
+        "verifier_notes": "Agreed: insufficient evidence without wrapper code."
+    })
+
+    async def mock_caller(sys, user):
+        if "Principal Application Security Engineer" in sys:
+            return mock_inv_json
+        return mock_ver_json
+
+    service = AlertReviewService(llm_caller=mock_caller)
+    alert = parse_github_alert_webhook(SAMPLE_WEBHOOK_PAYLOAD)
+
+    report = await service.review_normalized_alert(alert)
+
+    assert report.determination == DeterminationType.INSUFFICIENT_EVIDENCE
+    assert report.recommendation == RecommendationType.REQUEST_EVIDENCE
+    assert len(report.developer_questions) == 1
+    assert "dbWrapper" in report.developer_questions[0]
+    assert "Does dbWrapper.execute bind query parameters" in report.markdown_report
+    assert "Developer Action Required" in report.markdown_report
+    assert report.appsec_decision == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_reassess_with_developer_response_verifies_evidence():
+    """Verify that when developer supplies evidence, AI reassesses and verifies the claim."""
+    alert = parse_github_alert_webhook(SAMPLE_WEBHOOK_PAYLOAD)
+
+    mock_reassess_inv = json.dumps({
+        "claim_summary": "Reassessed with developer evidence",
+        "source_analysis": "req.params.id",
+        "propagation_analysis": "Taint neutralized by parseInt",
+        "sink_analysis": "Safe integer query",
+        "defenses_analysis": "parseInt sanitizes input",
+        "proposed_determination": "FALSE_POSITIVE",
+        "recommendation": "dismiss",
+        "preliminary_confidence": 0.95,
+        "code_references": [
+            {"path": "src/controllers/userController.js", "start_line": 20, "end_line": 22}
+        ],
+        "verified_evidence": ["parseInt(id, 10) confirmed in source code"],
+        "missing_evidence": [],
+        "developer_questions": [],
+        "supporting_evidence": [],
+        "opposing_evidence": [
+            {
+                "id": "opp-1",
+                "category": "SANITIZATION_DEFENSE",
+                "title": "Integer parsing",
+                "description": "id parsed to integer",
+                "code_reference": "parseInt(req.params.id, 10)",
+                "weight": 3.0
+            }
+        ],
+        "reasoning": "Developer evidence corroborated: input is converted to safe integer."
+    })
+
+    mock_reassess_ver = json.dumps({
+        "grounding_score": 1.0,
+        "ungrounded_claims": [],
+        "consensus_with_investigator": True,
+        "suggested_determination": "FALSE_POSITIVE",
+        "developer_evidence_verified": True,
+        "unverified_developer_claims": [],
+        "challenges": [],
+        "missing_context_flags": [],
+        "verifier_notes": "Confirmed false positive."
+    })
+
+    async def mock_caller(sys, user):
+        if "Principal Application Security Engineer" in sys:
+            return mock_reassess_inv
+        return mock_reassess_ver
+
+    service = AlertReviewService(llm_caller=mock_caller)
+    async def mock_reader(p, c):
+        return "const id = parseInt(req.params.id, 10);\ndb.query('SELECT * FROM users WHERE id = $1', [id]);"
+    service.context_builder.file_reader_override = mock_reader
+
+    # Run initial review so alert is cached
+    await service.review_normalized_alert(alert)
+
+    # Reassess with developer response
+    updated_report = await service.reassess_with_developer_response(
+        alert_id=alert.alert_id,
+        developer_response="We cast this to an integer with parseInt on line 20 before the query."
+    )
+
+    assert updated_report.determination == DeterminationType.FALSE_POSITIVE
+    assert updated_report.recommendation == RecommendationType.DISMISS
+    assert "Developer Feedback Received" in updated_report.markdown_report
+    assert "Corroborated by repository code inspection" in updated_report.markdown_report
+
+
+@pytest.mark.asyncio
+async def test_appsec_dismissal_authority_preserved():
+    """Verify that AI service never automatically dismisses alerts in GitHub (advisory only)."""
+    gen = ReportGenerator()
+    result = await gen.dismiss_github_alert(
+        owner="org",
+        repo="repo",
+        alert_number=42,
+        github_token="fake-token",
+        reason="false positive",
+        comment="AI says false positive"
+    )
+    # Automated dismissal must be blocked; AppSec holds exclusive authority
+    assert result is False
+

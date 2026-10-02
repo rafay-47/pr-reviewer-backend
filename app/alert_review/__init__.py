@@ -4,6 +4,8 @@ AI Code-Scanning Alert Review Service package.
 
 from .models_alert import (
     DeterminationType,
+    RecommendationType,
+    CodeReference,
     AlertSeverity,
     EvidenceCategory,
     EvidenceDirection,
@@ -34,6 +36,8 @@ from .github_app_service import GitHubAppAlertHandler
 
 __all__ = [
     "DeterminationType",
+    "RecommendationType",
+    "CodeReference",
     "AlertSeverity",
     "EvidenceCategory",
     "EvidenceDirection",

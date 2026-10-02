@@ -5625,6 +5625,17 @@ async def _handle_pull_request_webhook(payload, settings, record_webhook_event):
     """Handle pull request webhook events."""
     from .github_webhook import process_pull_request_webhook
     
+    action = payload.get("action")
+
+    # Invalidate stale CodeQL alert reviews on new commit push
+    if action == "synchronize":
+        try:
+            from .alert_review.github_app_service import GitHubAppAlertHandler
+            alert_handler = GitHubAppAlertHandler(settings=settings)
+            await alert_handler.handle_pull_request_synchronize(payload)
+        except Exception as e:
+            logger.warning(f"Error marking alert reviews as stale on synchronize: {e}")
+
     # Check if legacy PR diff review is enabled
     if not getattr(settings, "enable_pr_diff_review", True):
         logger.info("PR diff review is disabled (ENABLE_PR_DIFF_REVIEW=false). Skipping PR diff review.")
@@ -5808,10 +5819,18 @@ async def _handle_issue_comment_webhook(payload: dict, settings):
     body = comment.get("body", "")
     author = comment.get("user", {}).get("login")
     
-    # Only process commands (comments starting with /)
+    # Only process commands (comments starting with /) OR developer alert replies
     if not body.strip().startswith("/"):
-        logger.info(f"Ignoring non-command comment")
-        return {"received": True, "status": "ignored", "reason": "Not a command"}
+        try:
+            from .alert_review.github_app_service import GitHubAppAlertHandler
+            handler = GitHubAppAlertHandler(settings=settings)
+            dev_res = await handler.handle_developer_comment(payload)
+            if dev_res.get("status") == "processed":
+                return {"received": True, **dev_res}
+        except Exception as e:
+            logger.error(f"Error checking developer alert response in comment: {e}")
+        logger.info(f"Ignoring non-command comment: {body[:30]}")
+        return {"received": True, "status": "ignored", "reason": "Not a command or alert response"}
     
     # Get issue/PR details
     issue = payload.get("issue", {})
@@ -5957,6 +5976,13 @@ You can find the fingerprint in the finding's comment. Example: `/ignore a1b2c3d
                 
                 return {"received": True, "status": "success", "command": "ignore", "error": "No fingerprint provided"}
         
+        elif command == "/appsec":
+            # AppSec engineer approval/denial command
+            from .alert_review.github_app_service import GitHubAppAlertHandler
+            handler = GitHubAppAlertHandler(settings=settings)
+            appsec_res = await handler.handle_appsec_command(payload)
+            return {"received": True, "command": "appsec", **appsec_res}
+
         elif command == "/help":
             # Show help
             await post_pr_comment(
@@ -5967,13 +5993,17 @@ You can find the fingerprint in the finding's comment. Example: `/ignore a1b2c3d
 
 - `/review` - Re-run the security analysis
 - `/ignore <fingerprint>` - Dismiss a finding (provide fingerprint from finding comment)
+- `/appsec approve [#alert_id] [reason]` - AppSec approval to dismiss a CodeQL finding
+- `/appsec deny [#alert_id] [reason]` - AppSec denial of alert dismissal
 - `/help` - Show this help message
 
 **Resolve Findings:**
 - Click "Resolve conversation" on a finding to mark it as resolved
 - Click "Unresolve" to reopen a finding
 
-**Example:** `/ignore a1b2c3d4e5f6`""",
+**Examples:**
+- `/appsec approve #42 Verified parameterized queries in db_wrapper.py`
+- `/appsec deny #42 Raw string interpolation still present`""",
                 installation_id=installation_id,
                 settings=settings
             )

@@ -22,6 +22,22 @@ class DeterminationType(str, Enum):
     FALSE_POSITIVE = "FALSE_POSITIVE"
     NEEDS_REVIEW = "NEEDS_REVIEW"
     ACCEPTABLE_RISK = "ACCEPTABLE_RISK"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+
+
+class RecommendationType(str, Enum):
+    """Action recommendation for the finding."""
+    REQUEST_EVIDENCE = "request_evidence"
+    FIX = "fix"
+    DISMISS = "dismiss"
+    MANUAL_REVIEW = "manual_review"
+
+
+class CodeReference(BaseModel):
+    """Structured code reference pointer."""
+    path: str
+    start_line: int
+    end_line: Optional[int] = None
 
 
 class AlertSeverity(str, Enum):
@@ -161,6 +177,41 @@ class InvestigatorAssessment(BaseModel):
     sink_analysis: str
     defenses_analysis: str
     preliminary_confidence: float = Field(ge=0.0, le=1.0)
+    code_references: List[CodeReference] = Field(default_factory=list, description="Explicit code locations cited")
+    verified_evidence: List[str] = Field(default_factory=list, description="Verified facts from code inspection")
+    missing_evidence: List[str] = Field(default_factory=list, description="Evidence gaps requiring developer clarification")
+    developer_questions: List[str] = Field(default_factory=list, description="Specific questions for developer in PR")
+    recommendation: RecommendationType = Field(default=RecommendationType.MANUAL_REVIEW)
+
+    @field_validator('proposed_determination', mode='before')
+    @classmethod
+    def normalize_determination(cls, v: Any) -> DeterminationType:
+        if isinstance(v, DeterminationType):
+            return v
+        s = str(v).strip().upper()
+        if s in ("LIKELY_VALID", "VALID", "TRUE_POSITIVE", "TP"):
+            return DeterminationType.TRUE_POSITIVE
+        elif s in ("LIKELY_FALSE_POSITIVE", "FALSE_POSITIVE", "FP"):
+            return DeterminationType.FALSE_POSITIVE
+        elif s in ("INSUFFICIENT_EVIDENCE", "MISSING_EVIDENCE", "UNKNOWN"):
+            return DeterminationType.INSUFFICIENT_EVIDENCE
+        elif s in ("ACCEPTABLE_RISK", "ACCEPTED_RISK"):
+            return DeterminationType.ACCEPTABLE_RISK
+        return DeterminationType.NEEDS_REVIEW
+
+    @field_validator('recommendation', mode='before')
+    @classmethod
+    def normalize_recommendation(cls, v: Any) -> RecommendationType:
+        if isinstance(v, RecommendationType):
+            return v
+        s = str(v).strip().lower()
+        if s in ("request_evidence", "ask_developer", "evidence_needed"):
+            return RecommendationType.REQUEST_EVIDENCE
+        elif s in ("fix", "code_fix", "remediate"):
+            return RecommendationType.FIX
+        elif s in ("dismiss", "dismiss_alert"):
+            return RecommendationType.DISMISS
+        return RecommendationType.MANUAL_REVIEW
 
 
 # ==========================================
@@ -188,6 +239,24 @@ class VerificationReport(BaseModel):
     suggested_determination: DeterminationType
     missing_context_flags: List[str] = Field(default_factory=list)
     verifier_notes: str
+    developer_evidence_verified: bool = Field(default=True, description="Whether developer claims were verified against code")
+    unverified_developer_claims: List[str] = Field(default_factory=list, description="Claims by developer that were not backed by code")
+
+    @field_validator('suggested_determination', mode='before')
+    @classmethod
+    def normalize_suggested_determination(cls, v: Any) -> DeterminationType:
+        if isinstance(v, DeterminationType):
+            return v
+        s = str(v).strip().upper()
+        if s in ("LIKELY_VALID", "VALID", "TRUE_POSITIVE", "TP"):
+            return DeterminationType.TRUE_POSITIVE
+        elif s in ("LIKELY_FALSE_POSITIVE", "FALSE_POSITIVE", "FP"):
+            return DeterminationType.FALSE_POSITIVE
+        elif s in ("INSUFFICIENT_EVIDENCE", "MISSING_EVIDENCE", "UNKNOWN"):
+            return DeterminationType.INSUFFICIENT_EVIDENCE
+        elif s in ("ACCEPTABLE_RISK", "ACCEPTED_RISK"):
+            return DeterminationType.ACCEPTABLE_RISK
+        return DeterminationType.NEEDS_REVIEW
 
 
 # ==========================================
@@ -236,6 +305,15 @@ class TriageReport(BaseModel):
     remediation: RemediationPlan
     limitations: List[str] = Field(default_factory=list)
     markdown_report: str
+    code_references: List[CodeReference] = Field(default_factory=list)
+    verified_evidence: List[str] = Field(default_factory=list)
+    missing_evidence: List[str] = Field(default_factory=list)
+    developer_questions: List[str] = Field(default_factory=list)
+    recommendation: RecommendationType = Field(default=RecommendationType.MANUAL_REVIEW)
+    appsec_decision: str = Field(default="PENDING", description="Status of AppSec decision: PENDING, APPROVED, DENIED")
+    is_stale: bool = Field(default=False, description="True if new commits arrived after assessment")
+    pr_comment_id: Optional[int] = Field(default=None, description="GitHub PR comment ID for in-place updates")
+    developer_feedback: Optional[str] = Field(default=None, description="Latest developer justification or reply")
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     agent_version: str = Field(default="1.0.0-alert-review")
 

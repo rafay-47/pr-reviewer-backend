@@ -141,3 +141,36 @@ def test_review_sarif_endpoint():
         assert "TRUE POSITIVE" in reports[0]["markdown_report"]
     finally:
         app.dependency_overrides.clear()
+
+
+def test_appsec_decision_endpoint():
+    """Verify AppSec approval/denial via REST API."""
+    mock_service = AlertReviewService()
+    app.dependency_overrides[get_alert_service] = lambda: mock_service
+
+    try:
+        # 1. Submit approval
+        payload = {
+            "repo": "test-org/test-repo",
+            "alert_id": "test-org/test-repo#77",
+            "decision": "approve",
+            "reason": "Parameter binding confirmed by AppSec lead",
+            "reviewer_id": "appsec_lead"
+        }
+        response = client.post("/api/v1/alerts/decision", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+        assert data["decision"] == "approved"
+        assert "APPROVED by @appsec_lead" in data["decision_text"]
+
+        # 2. Check queue
+        queue_resp = client.get("/api/v1/alerts/queue")
+        assert queue_resp.status_code == 200
+
+        # 3. Check calibration metrics updated
+        cal_resp = client.get("/api/v1/alerts/calibration")
+        assert cal_resp.status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+

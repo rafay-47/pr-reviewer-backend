@@ -72,30 +72,52 @@ class AlertReviewService:
         self.confidence_engine = ConfidenceEngine()
         self.report_generator = ReportGenerator()
         self.calibration_store = CalibrationStore(db_client=db_client)
+        self._normalized_alert_cache: Dict[str, NormalizedAlert] = {}
 
-    async def review_normalized_alert(self, alert: NormalizedAlert) -> TriageReport:
+    async def review_normalized_alert(
+        self,
+        alert: NormalizedAlert,
+        developer_feedback: Optional[str] = None,
+        is_stale: bool = False,
+        appsec_decision: str = "PENDING",
+        pr_comment_id: Optional[int] = None
+    ) -> TriageReport:
         """
         Execute the 6-stage review on an already normalized alert.
         
         Args:
             alert: NormalizedAlert instance.
+            developer_feedback: Optional developer explanation or response to previous questions.
+            is_stale: Whether the commit being reviewed has been superseded by newer commits.
+            appsec_decision: Status of human AppSec decision ('PENDING', 'APPROVED', 'DENIED').
+            pr_comment_id: GitHub PR comment ID for in-place updates.
             
         Returns:
             TriageReport instance.
         """
-        logger.info(f"Starting AI Alert Review for {alert.alert_id} ({alert.rule_id})")
+        logger.info(f"Starting AI Alert Review for {alert.alert_id} ({alert.rule_id}) [Feedback: {bool(developer_feedback)}]")
+        self._normalized_alert_cache[alert.alert_id] = alert
 
         # Stage 2: Code Context Builder
         logger.debug(f"[Stage 2] Building code context for {alert.alert_id}")
         context: AlertCodeContext = await self.context_builder.build_context(alert)
 
-        # Stage 3: AI Investigator
+        # Stage 3: AI Investigator (evaluates scanner claim + developer feedback if provided)
         logger.debug(f"[Stage 3] Running AI Investigator for {alert.alert_id}")
-        assessment: InvestigatorAssessment = await self.investigator.investigate(alert, context)
+        assessment: InvestigatorAssessment = await self.investigator.investigate(
+            alert=alert,
+            context=context,
+            developer_feedback=developer_feedback
+        )
 
-        # Stage 4: Evidence Verifier & Reviewer
+        # Stage 4: Evidence Verifier & Reviewer (scrutinizes investigator and developer claims)
         logger.debug(f"[Stage 4] Running Adversarial Verifier for {alert.alert_id}")
-        verification: VerificationReport = await self.verifier.verify(alert, context, assessment)
+        verification: VerificationReport = await self.verifier.verify(
+            alert=alert,
+            context=context,
+            assessment=assessment,
+            developer_feedback=developer_feedback
+        )
 
         # Stage 5: Determination & Confidence Engine
         logger.debug(f"[Stage 5] Evaluating Determination and Confidence for {alert.alert_id}")
@@ -106,7 +128,7 @@ class AlertReviewService:
             verifier=verification
         )
 
-        # Stage 6: Report Generator
+        # Stage 6: Report Generator (assembles structured single-card PR format)
         logger.debug(f"[Stage 6] Generating Triage Report for {alert.alert_id}")
         report: TriageReport = self.report_generator.generate_report(
             alert=alert,
@@ -114,41 +136,50 @@ class AlertReviewService:
             investigator=assessment,
             verifier=verification,
             determination=determination,
-            confidence=confidence
+            confidence=confidence,
+            developer_feedback=developer_feedback,
+            is_stale=is_stale,
+            appsec_decision=appsec_decision,
+            pr_comment_id=pr_comment_id
         )
 
         # Storage & Persistence
         await self.calibration_store.save_triage_report(report)
 
-        # Optional Auto-Dismissal via GitHub API
-        if (
-            self.auto_dismiss_false_positives
-            and determination == DeterminationType.FALSE_POSITIVE
-            and confidence.score >= self.min_dismiss_confidence
-            and self.github_token
-            and "#" in alert.alert_id
-        ):
-            try:
-                repo_part, alert_num_str = alert.alert_id.split("#", 1)
-                owner, repo_name = repo_part.split("/", 1)
-                if alert_num_str.isdigit():
-                    alert_number = int(alert_num_str)
-                    await self.report_generator.dismiss_github_alert(
-                        owner=owner,
-                        repo=repo_name,
-                        alert_number=alert_number,
-                        github_token=self.github_token,
-                        reason="false positive",
-                        comment=f"AI Alert Review: Validated False Positive ({confidence.score:.0%} confidence)."
-                    )
-            except Exception as e:
-                logger.warning(f"Auto-dismissal failed for {alert.alert_id}: {e}")
-
         logger.info(
             f"Completed AI Alert Review for {alert.alert_id}: "
-            f"Verdict={determination.value}, Confidence={confidence.score:.0%} ({confidence.qualitative_level})"
+            f"Verdict={determination.value}, Confidence={confidence.score:.0%} ({confidence.qualitative_level}) - AppSec Final Authority Preserved"
         )
         return report
+
+    async def reassess_with_developer_response(
+        self,
+        alert_id: str,
+        developer_response: str,
+        pr_comment_id: Optional[int] = None,
+        cached_alert: Optional[NormalizedAlert] = None
+    ) -> TriageReport:
+        """
+        Re-evaluate an alert when the developer supplies evidence or answers in the PR thread.
+        
+        Args:
+            alert_id: Unique alert ID (e.g. 'org/repo#42').
+            developer_response: Plaintext reply from developer.
+            pr_comment_id: ID of the PR comment to update.
+            cached_alert: Optional pre-normalized alert object.
+            
+        Returns:
+            Updated TriageReport.
+        """
+        alert = cached_alert or self._normalized_alert_cache.get(alert_id)
+        if not alert:
+            raise ValueError(f"No alert data found for {alert_id} to perform reassessment.")
+
+        return await self.review_normalized_alert(
+            alert=alert,
+            developer_feedback=developer_response,
+            pr_comment_id=pr_comment_id
+        )
 
     async def review_webhook_payload(self, payload: Dict[str, Any]) -> Optional[TriageReport]:
         """
@@ -195,6 +226,49 @@ class AlertReviewService:
             reviewer_id=reviewer_id
         )
         return await self.calibration_store.record_human_outcome(feedback)
+
+    async def record_appsec_decision(
+        self,
+        repo: str,
+        alert_id: str,
+        decision: str,
+        reason: Optional[str] = None,
+        reviewer: Optional[str] = None,
+        pr_number: Optional[int] = None,
+        github_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Record and execute an official AppSec engineer dismissal approval or denial.
+        AppSec engineers hold exclusive dismissal authority.
+        """
+        if "/" in repo:
+            owner, repo_name = repo.split("/", 1)
+        else:
+            owner, repo_name = "", repo
+
+        alert_num_str = alert_id.split("#")[-1]
+        alert_number = int(alert_num_str) if alert_num_str.isdigit() else 0
+
+        from .github_app_service import GitHubAppAlertHandler
+        handler = GitHubAppAlertHandler(service=self)
+        token = github_token or self.github_token
+
+        return await handler.apply_appsec_decision(
+            owner=owner,
+            repo=repo_name,
+            alert_number=alert_number,
+            decision=decision,
+            reason=reason,
+            reviewer=reviewer,
+            pr_number=pr_number,
+            token=token
+        )
+
+    def get_alert_queue(self, status: Optional[str] = None, limit: int = 50) -> List[TriageReport]:
+        """
+        Retrieve queue of alerts for AppSec review.
+        """
+        return self.calibration_store.get_reports(status=status, limit=limit)
 
     def get_calibration_metrics(self) -> CalibrationMetrics:
         """

@@ -49,6 +49,13 @@ class CalibrationStore:
                     "determination": report.determination.value,
                     "confidence_score": report.confidence.score,
                     "confidence_level": report.confidence.qualitative_level,
+                    "recommendation": report.recommendation.value,
+                    "appsec_decision": report.appsec_decision,
+                    "is_stale": report.is_stale,
+                    "pr_comment_id": report.pr_comment_id,
+                    "developer_feedback": report.developer_feedback,
+                    "developer_questions": report.developer_questions,
+                    "missing_evidence": report.missing_evidence,
                     "executive_summary": report.executive_summary,
                     "markdown_report": report.markdown_report,
                     "created_at": report.created_at,
@@ -59,6 +66,57 @@ class CalibrationStore:
                 logger.warning(f"Could not persist alert_review to database: {e}")
 
         return report.alert_id
+
+    def get_report(self, alert_id: str) -> Optional[TriageReport]:
+        """Get a triage report by alert ID."""
+        if alert_id in self._in_memory_reports:
+            return self._in_memory_reports[alert_id]
+        for aid, rep in self._in_memory_reports.items():
+            if aid.endswith(f"#{alert_id}") or aid == alert_id:
+                return rep
+        return None
+
+    def get_reports(self, status: Optional[str] = None, limit: int = 50) -> List[TriageReport]:
+        """Get triage reports optionally filtered by decision status or determination."""
+        reports = list(self._in_memory_reports.values())
+        if status:
+            st = status.upper()
+            reports = [
+                r for r in reports
+                if (r.appsec_decision and r.appsec_decision.upper() == st)
+                or (r.determination and r.determination.value.upper() == st)
+                or (st == "PENDING" and (not r.appsec_decision or r.appsec_decision.upper() == "PENDING"))
+            ]
+        return reports[:limit]
+
+    async def update_report(self, report: TriageReport) -> bool:
+        """Update an existing triage report."""
+        self._in_memory_reports[report.alert_id] = report
+        if self.db_client:
+            try:
+                row = {
+                    "alert_id": report.alert_id,
+                    "repo": report.repo,
+                    "commit_sha": report.commit_sha,
+                    "rule_id": report.rule_id,
+                    "determination": report.determination.value,
+                    "confidence_score": report.confidence.score,
+                    "confidence_level": report.confidence.qualitative_level,
+                    "recommendation": report.recommendation.value,
+                    "appsec_decision": report.appsec_decision,
+                    "is_stale": report.is_stale,
+                    "pr_comment_id": report.pr_comment_id,
+                    "developer_feedback": report.developer_feedback,
+                    "developer_questions": report.developer_questions,
+                    "missing_evidence": report.missing_evidence,
+                    "executive_summary": report.executive_summary,
+                    "markdown_report": report.markdown_report,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self.db_client.table("alert_reviews").upsert(row).execute()
+            except Exception as e:
+                logger.warning(f"Could not update alert_review in database: {e}")
+        return True
 
     async def record_human_outcome(self, feedback: HumanTriageFeedback) -> bool:
         """

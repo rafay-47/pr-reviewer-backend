@@ -56,6 +56,16 @@ class AlertFeedbackRequest(BaseModel):
     reviewer_id: Optional[str] = None
 
 
+class AppSecDecisionRequest(BaseModel):
+    """Request payload for AppSec engineer approval/denial decision."""
+    repo: str
+    alert_id: str
+    decision: str  # "approve" or "deny"
+    reason: Optional[str] = None
+    reviewer_id: Optional[str] = "appsec_engineer"
+    pr_number: Optional[int] = None
+
+
 @router.get("/health", summary="Health check for Alert Review Service")
 async def health_check():
     return {
@@ -138,3 +148,38 @@ async def get_calibration_stats(
     Get accuracy, Brier score, and calibration bucket statistics across all retained human outcomes.
     """
     return service.get_calibration_metrics()
+
+
+@router.post("/decision", summary="Submit AppSec dismissal approval or denial decision")
+async def record_appsec_decision(
+    request: AppSecDecisionRequest,
+    service: AlertReviewService = Depends(get_alert_service)
+):
+    """
+    AppSec holds final approval authority.
+    Records human AppSec approval or denial, updates the GitHub Code Scanning alert via API,
+    updates PR review comments in-place, and feeds continuous model calibration.
+    """
+    res = await service.record_appsec_decision(
+        repo=request.repo,
+        alert_id=request.alert_id,
+        decision=request.decision,
+        reason=request.reason,
+        reviewer=request.reviewer_id,
+        pr_number=request.pr_number
+    )
+    return res
+
+
+@router.get("/queue", response_model=List[TriageReport], summary="Get AppSec alert review queue")
+async def get_alert_queue(
+    status: Optional[str] = None,
+    limit: int = 50,
+    service: AlertReviewService = Depends(get_alert_service)
+):
+    """
+    Retrieve list of CodeQL alerts triaged by AI with recommendations and AppSec decision status.
+    Filter by status: 'PENDING', 'APPROVED', 'DENIED', 'INSUFFICIENT_EVIDENCE', 'TRUE_POSITIVE', etc.
+    """
+    return service.get_alert_queue(status=status, limit=limit)
+
