@@ -5542,6 +5542,21 @@ async def github_webhook_endpoint(request: Request):
         handler = GitHubAppAlertHandler(settings=settings)
         result = await handler.process_check_run_event(payload)
         return {"received": True, **result}
+    elif event_type == "check_suite":
+        from .alert_review.github_app_service import GitHubAppAlertHandler
+        handler = GitHubAppAlertHandler(settings=settings)
+        result = await handler.process_check_suite_event(payload)
+        return {"received": True, **result}
+    elif event_type == "workflow_run":
+        from .alert_review.github_app_service import GitHubAppAlertHandler
+        handler = GitHubAppAlertHandler(settings=settings)
+        result = await handler.process_workflow_run_event(payload)
+        return {"received": True, **result}
+    elif event_type == "pull_request_review":
+        from .alert_review.github_app_service import GitHubAppAlertHandler
+        handler = GitHubAppAlertHandler(settings=settings)
+        result = await handler.process_pull_request_review_event(payload)
+        return {"received": True, **result}
     elif event_type == "installation":
         return await _handle_installation_webhook(payload)
     elif event_type == "installation_repositories":
@@ -5819,7 +5834,19 @@ async def _handle_issue_comment_webhook(payload: dict, settings):
     body = comment.get("body", "")
     author = comment.get("user", {}).get("login")
     
-    # Only process commands (comments starting with /) OR developer alert replies
+    # 1. Check if comment is a CodeQL finding comment (e.g. ## CodeQL / Server-side request forgery...)
+    body_lower = body.lower()
+    if "codeql" in body_lower:
+        try:
+            from .alert_review.github_app_service import GitHubAppAlertHandler
+            handler = GitHubAppAlertHandler(settings=settings)
+            codeql_res = await handler.handle_codeql_comment(payload)
+            if codeql_res.get("status") == "processed":
+                return {"received": True, **codeql_res}
+        except Exception as e:
+            logger.error(f"Error checking CodeQL finding in comment: {e}", exc_info=True)
+
+    # 2. Process commands (starting with /) OR developer alert replies
     if not body.strip().startswith("/"):
         try:
             from .alert_review.github_app_service import GitHubAppAlertHandler

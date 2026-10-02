@@ -683,5 +683,129 @@ async def test_handle_appsec_command_deny():
         assert "DENIED by @sec-lead" in comment_patch_calls[0][1]["json"]["body"]
 
 
+@pytest.mark.asyncio
+async def test_handle_codeql_comment_triggers_triage():
+    """
+    Verify that when CodeQL posts a finding comment (e.g. '## CodeQL / Server-side request forgery'),
+    the reviewer catches it, runs the 6-stage AI pipeline, and posts the consolidated review card.
+    """
+    service = AlertReviewService()
+    # Mock LLM to return a triage assessment
+    mock_inv = json.dumps({
+        "claim_summary": "Server-side request forgery",
+        "source_analysis": "req.query.url",
+        "propagation_analysis": "Passed to fetch()",
+        "sink_analysis": "HTTP request",
+        "defenses_analysis": "No URL allowlist",
+        "proposed_determination": "likely_valid",
+        "preliminary_confidence": 0.90,
+        "supporting_evidence": [],
+        "opposing_evidence": [],
+        "reasoning": "Unvalidated URL passed to fetch"
+    })
+    mock_ver = json.dumps({
+        "grounding_score": 1.0,
+        "ungrounded_claims": [],
+        "consensus_with_investigator": True,
+        "suggested_determination": "likely_valid",
+        "challenges": [],
+        "missing_context_flags": [],
+        "verifier_notes": "Verified"
+    })
+    async def mock_caller(sys, user):
+        if "Principal Application Security Engineer" in sys:
+            return mock_inv
+        return mock_ver
+    service.investigator.llm_caller = mock_caller
+    service.verifier.llm_caller = mock_caller
+    service.context_builder.file_reader_override = AsyncMock(return_value="import fetch from 'node-fetch';\nfetch(req.query.url);")
+
+    handler = GitHubAppAlertHandler(service=service)
+    handler.get_token_for_payload = AsyncMock(return_value="mock-token")
+
+    with patch("httpx.AsyncClient.post") as mock_post, \
+         patch("httpx.AsyncClient.get") as mock_get:
+
+        mock_post_resp = MagicMock()
+        mock_post_resp.status_code = 201
+        mock_post_resp.json.return_value = {"id": 88888}
+        mock_post.return_value = mock_post_resp
+
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = []
+        mock_get.return_value = mock_get_resp
+
+        # Payload matching the exact user log: '## CodeQL / Server-side reques'
+        codeql_comment_payload = {
+            "action": "created",
+            "repository": {"full_name": "acme/api-server"},
+            "issue": {"number": 15},
+            "comment": {
+                "id": 777,
+                "body": "## CodeQL / Server-side request forgery (js/server-side-request-forgery)\nPotential SSRF vulnerability at src/proxy.ts:25",
+                "path": "src/proxy.ts",
+                "line": 25,
+                "commit_id": "commit_ssrf_123",
+                "user": {"login": "github-actions[bot]", "type": "Bot"}
+            }
+        }
+
+        result = await handler.handle_codeql_comment(codeql_comment_payload)
+        assert result["status"] == "processed"
+        assert result["event_type"] == "codeql_comment_triage"
+        assert "server-side-request-forgery" in result["rule"].lower()
+
+        # Verify bot review card was posted to PR #15
+        post_calls = [c for c in mock_post.call_args_list if "issues/15/comments" in c[0][0]]
+        assert len(post_calls) >= 1
+        body = post_calls[0][1]["json"]["body"]
+        assert "<!-- AI_CODEQL_ALERT_REVIEW:" in body
+        assert "AI AppSec Review" in body
+
+
+@pytest.mark.asyncio
+async def test_process_workflow_run_event_codeql_completed():
+    """
+    Verify that when CodeQL workflow completes, alerts are fetched from API and triaged.
+    """
+    service = AlertReviewService()
+    handler = GitHubAppAlertHandler(service=service)
+    handler.get_token_for_payload = AsyncMock(return_value="mock-token")
+    handler.process_webhook_event = AsyncMock(return_value={"status": "processed", "determination": "TRUE_POSITIVE"})
+
+    with patch("httpx.AsyncClient.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [
+            {
+                "number": 99,
+                "rule": {"id": "js/sql-injection", "name": "SQL Injection"},
+                "most_recent_instance": {
+                    "ref": "refs/pull/15/merge",
+                    "commit_sha": "sha123",
+                    "location": {"path": "src/db.js", "start_line": 10}
+                }
+            }
+        ]
+        mock_get.return_value = mock_resp
+
+        payload = {
+            "action": "completed",
+            "workflow_run": {
+                "name": "CodeQL",
+                "head_sha": "sha123",
+                "pull_requests": [{"number": 15}]
+            },
+            "repository": {"full_name": "acme/api-server"}
+        }
+
+        result = await handler.process_workflow_run_event(payload)
+        assert result["status"] == "processed"
+        assert result["alerts_reviewed"] == 1
+        handler.process_webhook_event.assert_called_once()
+
+
+
 
 

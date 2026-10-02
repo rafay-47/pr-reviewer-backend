@@ -853,11 +853,346 @@ class GitHubAppAlertHandler:
             logger.info(f"Ignoring code_scanning_alert action: {action}")
             return {"status": "ignored", "reason": f"Action {action} not processed"}
 
+    async def fetch_alerts_for_pr(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: Optional[int],
+        commit_sha: Optional[str],
+        token: str
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch CodeQL code scanning alerts for a pull request from GitHub REST API.
+        Tries multiple ref and commit query strategies:
+        1. refs/pull/{pr_number}/merge (how CodeQL action records PR scans)
+        2. refs/pull/{pr_number}/head
+        3. commit_sha
+        4. open alerts on repo filtered by PR ref or commit
+        """
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28"
+        }
+        alerts_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/code-scanning/alerts"
+        alerts = []
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            # Strategy 1: PR merge ref (standard CodeQL action PR ref)
+            if pr_number:
+                try:
+                    resp = await client.get(alerts_url, headers=headers, params={"ref": f"refs/pull/{pr_number}/merge"})
+                    if resp.status_code == 200 and resp.json():
+                        alerts.extend(resp.json())
+                except Exception as e:
+                    logger.debug(f"Query refs/pull/{pr_number}/merge: {e}")
+
+            # Strategy 2: PR head ref
+            if not alerts and pr_number:
+                try:
+                    resp = await client.get(alerts_url, headers=headers, params={"ref": f"refs/pull/{pr_number}/head"})
+                    if resp.status_code == 200 and resp.json():
+                        alerts.extend(resp.json())
+                except Exception as e:
+                    logger.debug(f"Query refs/pull/{pr_number}/head: {e}")
+
+            # Strategy 3: commit SHA
+            if not alerts and commit_sha:
+                try:
+                    resp = await client.get(alerts_url, headers=headers, params={"commit_sha": commit_sha})
+                    if resp.status_code == 200 and resp.json():
+                        alerts.extend(resp.json())
+                except Exception as e:
+                    logger.debug(f"Query commit_sha {commit_sha}: {e}")
+
+            # Strategy 4: open alerts on repo matching PR ref or commit
+            if not alerts:
+                try:
+                    resp = await client.get(alerts_url, headers=headers, params={"state": "open", "per_page": 50})
+                    if resp.status_code == 200 and resp.json():
+                        raw_list = resp.json()
+                        for item in raw_list:
+                            inst_ref = item.get("most_recent_instance", {}).get("ref") or ""
+                            inst_sha = item.get("most_recent_instance", {}).get("commit_sha") or ""
+                            if (pr_number and f"refs/pull/{pr_number}" in inst_ref) or (commit_sha and commit_sha.startswith(inst_sha[:8])):
+                                alerts.append(item)
+                        if not alerts and raw_list and pr_number:
+                            # If no exact ref match, include open alerts created recently
+                            alerts = raw_list[:5]
+                except Exception as e:
+                    logger.debug(f"Query open alerts: {e}")
+
+        # Deduplicate alerts by alert number
+        seen_numbers = set()
+        unique_alerts = []
+        for a in alerts:
+            num = a.get("number")
+            if num not in seen_numbers:
+                seen_numbers.add(num)
+                unique_alerts.append(a)
+
+        return unique_alerts
+
+    async def handle_codeql_comment(
+        self,
+        payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle comments posted on a PR by CodeQL Action (e.g. '## CodeQL / ...').
+        Parses finding directly from comment and/or fetches details from Code Scanning API,
+        then executes the 6-stage AI triage pipeline and posts the consolidated review card.
+        """
+        comment = payload.get("comment", {})
+        body = comment.get("body", "")
+        if not body or not ("codeql" in body.lower()):
+            return {"status": "ignored", "reason": "Not a CodeQL comment"}
+
+        repo_data = payload.get("repository", {})
+        repo_full = repo_data.get("full_name") or ""
+        if "/" not in repo_full:
+            return {"status": "ignored", "reason": "Invalid repository"}
+
+        owner, repo_name = repo_full.split("/", 1)
+        issue = payload.get("issue") or payload.get("pull_request") or {}
+        pr_number = issue.get("number") or payload.get("pull_request", {}).get("number")
+        if not pr_number:
+            return {"status": "ignored", "reason": "Not a pull request"}
+
+        token = await self.get_token_for_payload(payload)
+        if token:
+            self.service.context_builder.github_token = token
+            self.service.github_token = token
+
+        logger.info(f"Detected CodeQL finding comment on {repo_full}#{pr_number}: {body[:60]}")
+
+        # 1. Parse NormalizedAlert directly from comment as reliable baseline
+        from .alert_collector import parse_codeql_comment_payload
+        normalized = parse_codeql_comment_payload(payload)
+        if not normalized:
+            return {"status": "ignored", "reason": "Could not parse CodeQL comment"}
+
+        # 2. Try fetching richer alert instances with full dataflow trace from API if token available
+        if token:
+            commit_sha = normalized.commit_sha
+            api_alerts = await self.fetch_alerts_for_pr(owner, repo_name, pr_number, commit_sha, token)
+            for api_alert in api_alerts:
+                api_rule = api_alert.get("rule", {}).get("name") or api_alert.get("rule", {}).get("id") or ""
+                api_file = api_alert.get("most_recent_instance", {}).get("location", {}).get("path") or ""
+                if (normalized.rule_name.lower() in api_rule.lower() or api_rule.lower() in normalized.rule_name.lower()) or (api_file and api_file == normalized.primary_location.file_path):
+                    synthetic = {
+                        "action": "created",
+                        "alert": api_alert,
+                        "repository": repo_data,
+                        "installation": payload.get("installation", {})
+                    }
+                    from .alert_collector import parse_github_alert_webhook
+                    rich_normalized = parse_github_alert_webhook(synthetic)
+                    if rich_normalized:
+                        normalized = rich_normalized
+                        break
+
+        # 3. Execute 6-stage AI Review
+        report: TriageReport = await self.service.review_normalized_alert(normalized)
+
+        # 4. Post or update single consolidated review comment on PR
+        if token:
+            await self.post_or_update_pull_request_comment(
+                owner=owner,
+                repo=repo_name,
+                pr_number=pr_number,
+                report=report,
+                token=token
+            )
+            if normalized.commit_sha and normalized.commit_sha != "HEAD":
+                await self.create_check_run(owner, repo_name, normalized.commit_sha, report, token)
+
+        return {
+            "status": "processed",
+            "event_type": "codeql_comment_triage",
+            "alert_id": normalized.alert_id,
+            "rule": normalized.rule_id,
+            "determination": report.determination.value,
+            "confidence": report.confidence.score
+        }
+
+    async def process_pull_request_review_event(
+        self,
+        payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle pull_request_review webhook events.
+        Triggered when CodeQL Action submits a PR review on findings.
+        """
+        review = payload.get("review", {})
+        body = review.get("body") or ""
+        user_login = review.get("user", {}).get("login", "")
+        user_type = review.get("user", {}).get("type", "")
+
+        is_codeql = (
+            "codeql" in body.lower()
+            or "codeql" in user_login.lower()
+            or user_type == "Bot"
+        )
+        if not is_codeql:
+            return {"status": "ignored", "reason": "Not a CodeQL review"}
+
+        repo_data = payload.get("repository", {})
+        repo_full = repo_data.get("full_name") or ""
+        if "/" not in repo_full:
+            return {"status": "ignored", "reason": "Missing repository name"}
+
+        owner, repo_name = repo_full.split("/", 1)
+        pr = payload.get("pull_request", {})
+        pr_number = pr.get("number")
+        commit_sha = pr.get("head", {}).get("sha")
+
+        token = await self.get_token_for_payload(payload)
+        if not token:
+            return {"status": "error", "reason": "Could not obtain token"}
+
+        self.service.context_builder.github_token = token
+        self.service.github_token = token
+
+        alerts = await self.fetch_alerts_for_pr(owner, repo_name, pr_number, commit_sha, token)
+        if not alerts:
+            if body and "codeql" in body.lower():
+                synthetic_payload = {
+                    "comment": {"body": body, "commit_id": commit_sha, "html_url": review.get("html_url")},
+                    "repository": repo_data,
+                    "pull_request": pr,
+                    "installation": payload.get("installation", {})
+                }
+                return await self.handle_codeql_comment(synthetic_payload)
+            return {"status": "processed", "alerts_reviewed": 0, "message": "No code scanning alerts found"}
+
+        reviewed = []
+        for a in alerts:
+            synthetic_payload = {
+                "action": "created",
+                "alert": a,
+                "repository": repo_data,
+                "installation": payload.get("installation", {})
+            }
+            res = await self.process_webhook_event(synthetic_payload)
+            reviewed.append(res)
+
+        return {
+            "status": "processed",
+            "event_type": "pull_request_review_codeql_triage",
+            "alerts_reviewed": len(reviewed),
+            "results": reviewed
+        }
+
+    async def process_workflow_run_event(
+        self,
+        payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle completed workflow_run webhook events.
+        Triggered when CodeQL workflow completes in GitHub Actions.
+        """
+        action = payload.get("action")
+        if action != "completed":
+            return {"status": "ignored", "reason": f"Workflow run action '{action}' not completed"}
+
+        workflow_run = payload.get("workflow_run", {})
+        wf_name = workflow_run.get("name", "")
+        prs = workflow_run.get("pull_requests", [])
+        if not prs:
+            return {"status": "ignored", "reason": "Workflow run not tied to a PR"}
+
+        repo_data = payload.get("repository", {})
+        repo_full = repo_data.get("full_name") or ""
+        if "/" not in repo_full:
+            return {"status": "ignored", "reason": "Missing repository name"}
+
+        owner, repo_name = repo_full.split("/", 1)
+        commit_sha = workflow_run.get("head_sha")
+
+        token = await self.get_token_for_payload(payload)
+        if not token:
+            return {"status": "error", "reason": "Could not obtain token"}
+
+        self.service.context_builder.github_token = token
+        self.service.github_token = token
+
+        all_reviewed = []
+        for pr in prs:
+            pr_num = pr.get("number")
+            alerts = await self.fetch_alerts_for_pr(owner, repo_name, pr_num, commit_sha, token)
+            for a in alerts:
+                synthetic_payload = {
+                    "action": "created",
+                    "alert": a,
+                    "repository": repo_data,
+                    "installation": payload.get("installation", {})
+                }
+                res = await self.process_webhook_event(synthetic_payload)
+                all_reviewed.append(res)
+
+        return {
+            "status": "processed",
+            "event_type": "workflow_run_codeql_triage",
+            "workflow_name": wf_name,
+            "alerts_reviewed": len(all_reviewed),
+            "results": all_reviewed
+        }
+
+    async def process_check_suite_event(
+        self,
+        payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Handle completed check_suite webhook events.
+        """
+        action = payload.get("action")
+        if action != "completed":
+            return {"status": "ignored", "reason": f"Check suite action '{action}' not completed"}
+
+        check_suite = payload.get("check_suite", {})
+        prs = check_suite.get("pull_requests", [])
+        if not prs:
+            return {"status": "ignored", "reason": "Check suite not tied to a PR"}
+
+        repo_data = payload.get("repository", {})
+        repo_full = repo_data.get("full_name") or ""
+        if "/" not in repo_full:
+            return {"status": "ignored", "reason": "Missing repository name"}
+
+        owner, repo_name = repo_full.split("/", 1)
+        commit_sha = check_suite.get("head_sha")
+
+        token = await self.get_token_for_payload(payload)
+        if not token:
+            return {"status": "error", "reason": "Could not obtain token"}
+
+        self.service.context_builder.github_token = token
+        self.service.github_token = token
+
+        all_reviewed = []
+        for pr in prs:
+            pr_num = pr.get("number")
+            alerts = await self.fetch_alerts_for_pr(owner, repo_name, pr_num, commit_sha, token)
+            for a in alerts:
+                synthetic_payload = {
+                    "action": "created",
+                    "alert": a,
+                    "repository": repo_data,
+                    "installation": payload.get("installation", {})
+                }
+                res = await self.process_webhook_event(synthetic_payload)
+                all_reviewed.append(res)
+
+        return {
+            "status": "processed",
+            "event_type": "check_suite_codeql_triage",
+            "alerts_reviewed": len(all_reviewed),
+            "results": all_reviewed
+        }
+
     async def process_check_run_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle completed CodeQL Check Runs on PRs.
-        When CodeQL runs on a pull request, GitHub executes a check run (e.g. 'Code scanning results / CodeQL').
-        This method acts as a resilient trigger if GitHub's code_scanning_alert webhook is delayed or restricted to the default branch.
         """
         action = payload.get("action")
         if action != "completed":
@@ -866,11 +1201,9 @@ class GitHubAppAlertHandler:
         check_run = payload.get("check_run", {})
         check_name = check_run.get("name", "")
 
-        # Ignore our own AI Alert Review check runs to prevent recursion
         if check_name.startswith("AI CodeQL Review:") or check_name.startswith("AI Alert Review:"):
             return {"status": "ignored", "reason": "Ignoring AI Alert Review self-check run"}
 
-        # Only process CodeQL / Code scanning check runs
         if not ("code scanning" in check_name.lower() or "codeql" in check_name.lower()):
             return {"status": "ignored", "reason": f"Check run '{check_name}' is not a CodeQL scan"}
 
@@ -892,36 +1225,10 @@ class GitHubAppAlertHandler:
         self.service.context_builder.github_token = token
         self.service.github_token = token
 
-        # Fetch code scanning alerts for this commit / PR
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28"
-        }
-        alerts_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/code-scanning/alerts"
-        alerts = []
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.get(alerts_url, headers=headers, params={"commit_sha": commit_sha})
-                if resp.status_code == 200:
-                    alerts = resp.json()
-        except Exception as e:
-            logger.error(f"Error fetching code scanning alerts for {repo_full}@{commit_sha}: {e}")
+        prs = check_run.get("pull_requests", [])
+        pr_number = prs[0].get("number") if prs else None
 
-        # If empty, try fetching by PR ref
-        if not alerts:
-            prs = check_run.get("pull_requests", [])
-            for pr in prs:
-                pr_num = pr.get("number")
-                if pr_num:
-                    try:
-                        async with httpx.AsyncClient(timeout=20.0) as client:
-                            resp = await client.get(alerts_url, headers=headers, params={"ref": f"refs/pull/{pr_num}/head"})
-                            if resp.status_code == 200 and resp.json():
-                                alerts.extend(resp.json())
-                    except Exception as e:
-                        logger.warning(f"Error fetching alerts for PR #{pr_num}: {e}")
-
+        alerts = await self.fetch_alerts_for_pr(owner, repo_name, pr_number, commit_sha, token)
         if not alerts:
             logger.info(f"No code scanning alerts returned by API for {repo_full}@{commit_sha}")
             return {"status": "processed", "alerts_reviewed": 0, "message": "No alerts found for commit"}

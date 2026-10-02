@@ -95,6 +95,8 @@ def _extract_enclosing_block(lines: List[str], target_line_idx: int) -> tuple[in
 
 def _analyze_imports_and_env(full_text: str) -> tuple[List[str], List[str], List[str], List[str]]:
     """Extract imported modules, frameworks, and security layers from file text."""
+    if not isinstance(full_text, str):
+        full_text = str(full_text) if full_text is not None else ""
     imports = []
     frameworks = []
     db_layers = []

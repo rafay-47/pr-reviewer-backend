@@ -382,3 +382,121 @@ async def fetch_alert_from_github_api(
         raise ValueError(f"Could not normalize alert data for {repo_full}#{alert_number}")
         
     return normalized
+
+
+def parse_codeql_comment_payload(payload: Dict[str, Any]) -> Optional[NormalizedAlert]:
+    """
+    Parse a PR comment posted by CodeQL / GitHub Actions into a NormalizedAlert.
+    Supports comments starting with '## CodeQL / ' or containing CodeQL findings.
+    """
+    comment = payload.get("comment", {})
+    body = comment.get("body", "")
+    if not body:
+        return None
+
+    # Check if comment is from CodeQL
+    body_lower = body.lower()
+    is_codeql = (
+        body.startswith("## CodeQL")
+        or "## codeql" in body_lower
+        or "codeql /" in body_lower
+        or "[codeql]" in body_lower
+        or "codeql found" in body_lower
+    )
+    if not is_codeql:
+        return None
+
+    repo_data = payload.get("repository", {})
+    repo_name = repo_data.get("full_name") or "unknown/unknown"
+
+    issue = payload.get("issue") or payload.get("pull_request") or {}
+    pr_number = issue.get("number") or payload.get("pull_request", {}).get("number")
+
+    # Extract Rule Name and Rule ID: e.g. "## CodeQL / Server-side request forgery (js/server-side-request-forgery)"
+    rule_match = re.search(r"##\s*CodeQL\s*/\s*([^\n\(\r]+)(?:\s*\(([^)]+)\))?", body, re.IGNORECASE)
+    if rule_match:
+        rule_name = rule_match.group(1).strip()
+        rule_id = rule_match.group(2).strip() if rule_match.group(2) else f"codeql/{rule_name.lower().replace(' ', '-')}"
+    else:
+        # Fallback search for rule
+        header_match = re.search(r"##\s*CodeQL[^\n]*", body)
+        rule_name = header_match.group(0).replace("##", "").strip() if header_match else "CodeQL Security Finding"
+        rule_id = f"codeql/{rule_name.lower().replace(' ', '-')}"
+
+    # Extract Alert URL if present: e.g. https://github.com/owner/repo/security/code-scanning/123
+    alert_url_match = re.search(r"/security/code-scanning/(\d+)", body)
+    if alert_url_match:
+        alert_number = alert_url_match.group(1)
+        alert_id = f"{repo_name}#{alert_number}"
+        source_url = f"https://github.com/{repo_name}/security/code-scanning/{alert_number}"
+    else:
+        alert_slug = re.sub(r"[^a-zA-Z0-9_-]", "-", rule_name.lower())[:30].strip("-")
+        alert_id = f"{repo_name}#pr{pr_number}-{alert_slug}"
+        source_url = comment.get("html_url")
+
+    # Extract File Path and Line Number
+    file_path = comment.get("path")
+    line_number = comment.get("line") or comment.get("original_line") or 1
+
+    if not file_path:
+        loc_match = re.search(r"[`']?([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)[`']?[:\s]+line\s*(\d+)", body, re.IGNORECASE)
+        if not loc_match:
+            loc_match = re.search(r"[`']([a-zA-Z0-9_\-\./\\]+\.[a-zA-Z0-9]+)[:#]L?(\d+)[`']", body)
+        if loc_match:
+            file_path = loc_match.group(1)
+            line_number = int(loc_match.group(2))
+        else:
+            file_path = "src/codeql-finding.js"
+
+    # Commit SHA
+    commit_sha = (
+        comment.get("commit_id")
+        or payload.get("pull_request", {}).get("head", {}).get("sha")
+        or "HEAD"
+    )
+    ref = f"refs/pull/{pr_number}/merge" if pr_number else None
+
+    # Severity
+    severity = AlertSeverity.HIGH
+    if "critical" in body_lower:
+        severity = AlertSeverity.CRITICAL
+    elif "medium" in body_lower or "moderate" in body_lower:
+        severity = AlertSeverity.MEDIUM
+    elif "low" in body_lower or "note" in body_lower:
+        severity = AlertSeverity.LOW
+
+    # Extract CWE if mentioned
+    cwes = []
+    cwe_match = re.findall(r"\bCWE-(\d+)\b", body, re.IGNORECASE)
+    if cwe_match:
+        cwes = [f"CWE-{n}" for n in set(cwe_match)]
+
+    primary_location = CodeFlowNode(
+        file_path=file_path,
+        line_number=line_number,
+        step_type="sink",
+        description=f"Flagged location for {rule_name}"
+    )
+
+    code_flows = [CodeFlowPath(
+        path_id="flow_1",
+        nodes=[primary_location]
+    )]
+
+    return NormalizedAlert(
+        alert_id=alert_id,
+        repo=repo_name,
+        commit_sha=commit_sha,
+        ref=ref,
+        tool_name="CodeQL",
+        rule_id=rule_id,
+        rule_name=rule_name,
+        rule_description=rule_name,
+        severity=severity,
+        cwe_ids=cwes,
+        primary_location=primary_location,
+        code_flows=code_flows,
+        scanner_message=body[:500],
+        source_url=source_url
+    )
+
